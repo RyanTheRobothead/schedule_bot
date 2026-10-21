@@ -73,3 +73,13 @@ def test_mention_limit():
 
     assert mentions([3, 1, 2]) == "<@1> <@2> <@3>"
     assert mentions(range(100), 2) == "<@0> <@1> and 98 more"
+
+
+def test_breakdown_labels_who_is_out_or_maybe():
+    from schedule_bot.render import breakdown_lines
+    from schedule_bot.scoring import summarize
+    from schedule_bot.models import UserResponse
+
+    responses = {1: UserResponse(Status.AVAILABLE), 2: UserResponse(Status.UNAVAILABLE), 3: UserResponse(Status.TENTATIVE)}
+    (line,) = breakdown_lines(summarize(D[:1], responses), None)
+    assert line.endswith("— out: <@2> · maybe: <@3>")

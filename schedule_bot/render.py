@@ -63,11 +63,11 @@ def breakdown_lines(summaries: list[DaySummary], best: date | None) -> list[str]
             line += " 🏆"
         notes = []
         if s.by_status[Status.UNAVAILABLE]:
-            notes.append(f"{Status.UNAVAILABLE.emoji} {mentions(s.by_status[Status.UNAVAILABLE])}")
+            notes.append(f"out: {mentions(s.by_status[Status.UNAVAILABLE])}")
         if s.by_status[Status.TENTATIVE]:
-            notes.append(f"{Status.TENTATIVE.emoji} {mentions(s.by_status[Status.TENTATIVE])}")
+            notes.append(f"maybe: {mentions(s.by_status[Status.TENTATIVE])}")
         if notes:
-            line += " — " + " ".join(notes)
+            line += " — " + " · ".join(notes)
         lines.append(line)
     return lines
 
