@@ -1,0 +1,226 @@
+"""Buttons and select menus.
+
+Everything is a ``DynamicItem`` whose custom_id encodes the poll id, so components keep
+working after the bot restarts (including on users' already-open personal panels).
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from typing import TYPE_CHECKING
+
+import discord
+
+from .models import STATUS_ORDER, Poll, Status, UserResponse
+from .render import day_label, panel_text
+
+if TYPE_CHECKING:
+    from .bot import ScheduleBot
+
+_BUTTON_STYLE = {
+    Status.PREFERRED: discord.ButtonStyle.success,
+    Status.AVAILABLE: discord.ButtonStyle.primary,
+    Status.TENTATIVE: discord.ButtonStyle.secondary,
+    Status.UNAVAILABLE: discord.ButtonStyle.danger,
+}
+
+_DAY_SELECT_PLACEHOLDER = {
+    Status.PREFERRED: "⭐ Preferred on…",
+    Status.AVAILABLE: "✅ Available on…",
+    Status.TENTATIVE: "❔ Tentative on…",
+    Status.UNAVAILABLE: "❌ Unavailable on…",
+}
+
+
+def poll_view(poll: Poll) -> discord.ui.View:
+    """Components attached to the public poll message."""
+    view = discord.ui.View(timeout=None)
+    for status in STATUS_ORDER:
+        view.add_item(StatusButton(poll.id, status))
+    view.add_item(FineTuneButton(poll.id))
+    view.add_item(CloseButton(poll.id))
+    return view
+
+
+def panel_view(poll: Poll, response: UserResponse) -> discord.ui.View:
+    """A user's personal panel: one default picker plus one multi-select per status."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(DefaultSelect(poll.id, response.default))
+    for status in STATUS_ORDER:
+        selected = {d for d, s in response.overrides.items() if s == status}
+        view.add_item(DaySelect(poll.id, status, poll.days, selected))
+    return view
+
+
+async def _send_panel(interaction: discord.Interaction, poll: Poll, *, edit: bool) -> None:
+    bot: ScheduleBot = interaction.client  # type: ignore[assignment]
+    response = bot.db.response(poll.id, interaction.user.id)
+    kwargs = dict(content=panel_text(poll, response), view=panel_view(poll, response))
+    if edit:
+        await interaction.response.edit_message(**kwargs)
+    else:
+        await interaction.response.send_message(**kwargs, ephemeral=True)
+
+
+class StatusButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sched:status:(?P<poll>\d+):(?P<status>\d)"):
+    """Sets the clicker's default for every day, then opens their panel for fine-tuning."""
+
+    def __init__(self, poll_id: int, status: Status):
+        super().__init__(
+            discord.ui.Button(
+                label=status.label,
+                emoji=status.emoji,
+                style=_BUTTON_STYLE[status],
+                custom_id=f"sched:status:{poll_id}:{int(status)}",
+            ),
+            row=0,
+        )
+        self.poll_id = poll_id
+        self.status = status
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["poll"]), Status(int(match["status"])))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        bot: ScheduleBot = interaction.client  # type: ignore[assignment]
+        poll = await bot.open_poll_for(interaction, self.poll_id)
+        if poll is None:
+            return
+        bot.db.set_default(poll.id, interaction.user.id, self.status)
+        await _send_panel(interaction, poll, edit=False)
+        bot.request_refresh(poll.id)
+
+
+class FineTuneButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sched:panel:(?P<poll>\d+)"):
+    """Opens the clicker's panel without changing anything."""
+
+    def __init__(self, poll_id: int):
+        super().__init__(
+            discord.ui.Button(
+                label="Fine-tune days / view my answers",
+                emoji="🗓️",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"sched:panel:{poll_id}",
+            ),
+            row=1,
+        )
+        self.poll_id = poll_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["poll"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        bot: ScheduleBot = interaction.client  # type: ignore[assignment]
+        poll = await bot.open_poll_for(interaction, self.poll_id)
+        if poll is not None:
+            await _send_panel(interaction, poll, edit=False)
+
+
+class CloseButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sched:close:(?P<poll>\d+)"):
+    def __init__(self, poll_id: int):
+        super().__init__(
+            discord.ui.Button(
+                label="Close poll",
+                emoji="🔒",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"sched:close:{poll_id}",
+            ),
+            row=1,
+        )
+        self.poll_id = poll_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["poll"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        bot: ScheduleBot = interaction.client  # type: ignore[assignment]
+        poll = await bot.open_poll_for(interaction, self.poll_id)
+        if poll is None:
+            return
+        if interaction.user.id != poll.creator_id and not interaction.permissions.manage_messages:
+            await interaction.response.send_message(
+                f"Only <@{poll.creator_id}> (or a moderator) can close this poll.", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        await bot.close_poll(poll)
+
+
+class DefaultSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"sched:default:(?P<poll>\d+)"):
+    def __init__(self, poll_id: int, current: Status | None = None):
+        super().__init__(
+            discord.ui.Select(
+                custom_id=f"sched:default:{poll_id}",
+                placeholder="My default for every day…",
+                options=[
+                    discord.SelectOption(
+                        label=f"Default: {s.label}", value=str(int(s)), emoji=s.emoji, default=s == current
+                    )
+                    for s in STATUS_ORDER
+                ],
+            ),
+            row=0,
+        )
+        self.poll_id = poll_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["poll"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        bot: ScheduleBot = interaction.client  # type: ignore[assignment]
+        poll = await bot.open_poll_for(interaction, self.poll_id)
+        if poll is None:
+            return
+        values = interaction.data.get("values", [])  # type: ignore[union-attr]
+        if values:
+            bot.db.set_default(poll.id, interaction.user.id, Status(int(values[0])))
+        await _send_panel(interaction, poll, edit=True)
+        bot.request_refresh(poll.id)
+
+
+class DaySelect(discord.ui.DynamicItem[discord.ui.Select], template=r"sched:days:(?P<poll>\d+):(?P<status>\d)"):
+    """Multi-select of the days on which the user's answer is ``status`` instead of their default."""
+
+    def __init__(
+        self,
+        poll_id: int,
+        status: Status,
+        days: list[date] | None = None,
+        selected: set[date] | None = None,
+    ):
+        days = days or []
+        selected = selected or set()
+        super().__init__(
+            discord.ui.Select(
+                custom_id=f"sched:days:{poll_id}:{int(status)}",
+                placeholder=_DAY_SELECT_PLACEHOLDER[status],
+                min_values=0,
+                max_values=max(len(days), 1),
+                options=[
+                    discord.SelectOption(label=day_label(d), value=d.isoformat(), default=d in selected)
+                    for d in days
+                ],
+            ),
+            row=1 + STATUS_ORDER.index(status),
+        )
+        self.poll_id = poll_id
+        self.status = status
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["poll"]), Status(int(match["status"])))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        bot: ScheduleBot = interaction.client  # type: ignore[assignment]
+        poll = await bot.open_poll_for(interaction, self.poll_id)
+        if poll is None:
+            return
+        valid = set(poll.days)
+        picked = [date.fromisoformat(v) for v in interaction.data.get("values", [])]  # type: ignore[union-attr]
+        bot.db.set_days_for_status(poll.id, interaction.user.id, self.status, [d for d in picked if d in valid])
+        await _send_panel(interaction, poll, edit=True)
+        bot.request_refresh(poll.id)

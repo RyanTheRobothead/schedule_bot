@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "schedule-bot"
+version = "0.1.0"
+description = "Discord bot for scheduling TTRPG / game nights"
+requires-python = ">=3.11"
+dependencies = [
+    "discord.py>=2.4",
+    "dateparser>=1.2",
+    "tzdata",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+schedule-bot = "schedule_bot.__main__:main"
+
+[tool.setuptools]
+packages = ["schedule_bot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
