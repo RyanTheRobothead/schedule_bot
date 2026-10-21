@@ -3,6 +3,7 @@
   buildPythonApplication,
   setuptools,
   discordpy,
+  aiohttp,
   dateparser,
   tzdata,
   pytestCheckHook,
@@ -19,6 +20,7 @@ buildPythonApplication {
 
   dependencies = [
     discordpy
+    aiohttp
     dateparser
     tzdata
   ];

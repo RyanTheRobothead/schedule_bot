@@ -46,6 +46,24 @@ in
       '';
     };
 
+    healthCheck = {
+      port = lib.mkOption {
+        type = lib.types.nullOr lib.types.port;
+        default = null;
+        example = 8095;
+        description = ''
+          Serve `GET /health` on this port for uptime monitors: 200 while the bot is
+          connected to Discord, 503 otherwise. `null` disables it.
+        '';
+      };
+      address = lib.mkOption {
+        type = lib.types.str;
+        default = "127.0.0.1";
+        example = "0.0.0.0";
+        description = "Address the health endpoint listens on.";
+      };
+    };
+
     dateOrder = lib.mkOption {
       type = lib.types.enum [
         "MDY"
@@ -68,6 +86,10 @@ in
         SCHEDULE_BOT_TZ = cfg.timezone;
         SCHEDULE_BOT_DATE_ORDER = cfg.dateOrder;
         SCHEDULE_BOT_NAG_TIME = cfg.nagTime;
+      }
+      // lib.optionalAttrs (cfg.healthCheck.port != null) {
+        SCHEDULE_BOT_HEALTH_HOST = cfg.healthCheck.address;
+        SCHEDULE_BOT_HEALTH_PORT = toString cfg.healthCheck.port;
       };
       serviceConfig = {
         ExecStart = lib.getExe cfg.package;

@@ -31,6 +31,7 @@
           packages = [
             (pkgs.python3.withPackages (ps: [
               ps.discordpy
+              ps.aiohttp
               ps.dateparser
               ps.tzdata
               ps.pytest

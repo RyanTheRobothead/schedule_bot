@@ -15,6 +15,7 @@ from discord.ext import tasks
 from .config import Config
 from .dates import MAX_DAYS, DateRangeError, parse_date_range
 from .db import Database
+from .health import start_health_server
 from .invocation import (
     DEFAULT_TITLE,
     Invocation,
@@ -73,6 +74,7 @@ class ScheduleBot(discord.Client):
         self.tree.add_command(schedule_command)
         self._pending_refresh: set[int] = set()
         self._background: set[asyncio.Task] = set()
+        self._health_runner = None
 
     async def setup_hook(self) -> None:
         self.add_dynamic_items(StatusButton, SameAsLastButton, FineTuneButton, CloseButton, DefaultSelect, DaySelect)
@@ -83,6 +85,14 @@ class ScheduleBot(discord.Client):
             parse_date_range("jan 1 - jan 2", self.config.today())
         self.housekeeping.change_interval(minutes=self.config.housekeeping_minutes)
         self.housekeeping.start()
+        if self.config.health_port:
+            self._health_runner = await start_health_server(self, self.config.health_host, self.config.health_port)
+            log.info("Health check on http://%s:%s/health", self.config.health_host, self.config.health_port)
+
+    async def close(self) -> None:
+        if self._health_runner is not None:
+            await self._health_runner.cleanup()
+        await super().close()
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%s)", self.user, self.user.id if self.user else "?")

@@ -83,6 +83,8 @@ Configuration is all environment variables:
 | `SCHEDULE_BOT_DATE_ORDER` | How to read `03/04`: `MDY`, `DMY` or `YMD` | `MDY` |
 | `SCHEDULE_BOT_NAG` | Default reminder interval (`daily`, `12h`, `off`, …) | `daily` |
 | `SCHEDULE_BOT_NAG_TIME` | Time of day for whole-day reminders (`18:00`, `9am`), or `off` to count from when the poll was posted | `18:00` |
+| `SCHEDULE_BOT_HEALTH_PORT` | Serve `GET /health` here for uptime monitors (200 when connected to Discord, else 503) | off |
+| `SCHEDULE_BOT_HEALTH_HOST` | Address for the health endpoint | `127.0.0.1` |
 | `SCHEDULE_BOT_DB` | SQLite database path | `$XDG_STATE_HOME/schedule_bot/schedule_bot.db` |
 
 ```sh
@@ -113,6 +115,8 @@ Without Nix: `pip install .` then run `schedule-bot`.
 }
 ```
 
+Set `services.schedule-bot.healthCheck.port` (and `.address`) to expose `/health` for a monitor like Gatus.
+
 The service runs as a `DynamicUser` and keeps its database in `/var/lib/schedule-bot`.
 
 ## Development
@@ -134,4 +138,5 @@ Layout:
 - `schedule_bot/db.py`: SQLite storage
 - `schedule_bot/render.py`: embeds and panel text
 - `schedule_bot/views.py`: buttons and menus (`DynamicItem`s, so they keep working across restarts)
+- `schedule_bot/health.py`: the optional `/health` endpoint
 - `schedule_bot/bot.py`: the client: mentions and `/schedule`, live message updates, reminders, closing
