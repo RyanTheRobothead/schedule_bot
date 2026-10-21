@@ -10,6 +10,9 @@ A Discord bot for scheduling semi-regular game nights without anyone leaving Dis
 @schedule_bot help
 ```
 
+Or use the `/schedule` slash command, which has the same options as fields (`dates`, `title`,
+`invite`, `nag`) and shows hints as you type.
+
 ## How answering works
 
 The poll message has four buttons: **⭐ Preferred · ✅ Available · ❔ Tentative · ❌ Unavailable**.
@@ -22,6 +25,11 @@ The poll message has four buttons: **⭐ Preferred · ✅ Available · ❔ Tenta
 "Available all week, except Tuesday unavailable and Friday preferred" is three clicks:
 **✅ Available** → *❌ Unavailable on… Tue* → *⭐ Preferred on… Fri*.
 
+**🔁 Same as last time** copies your answer from the previous poll in this server, matched up by
+weekday: if last time you were available except Tuesdays, you're available except Tuesdays again.
+It's always a click you make; the bot never answers for you, so reminders still reach anyone who
+hasn't clicked anything.
+
 The 🗓️ button reopens your panel to check or change your answers. Anyone can respond, even if
 they weren't invited; they're added to the poll.
 
@@ -30,8 +38,10 @@ the top three days, and who hasn't answered yet. Ranking: fewest people unavaila
 fewest maybes, then the most ⭐, then the earliest date. So a day everyone can make beats a day four
 people love and one person can't do.
 
-**Reminders:** once a day by default, the bot @-mentions anyone invited who hasn't answered.
-Change it per poll with `nag=12h`, `nag=2d`, `nag=off` / `no nag`.
+**Reminders:** once a day by default, at 6pm (`SCHEDULE_BOT_NAG_TIME`), the bot @-mentions anyone
+invited who hasn't answered. The first one waits at least 6 hours after the poll goes up. Change it
+per poll with `nag=12h`, `nag=2d`, `nag=9am` (daily at 9am), `nag=2d@7pm`, `nag=off` / `no nag`.
+Whole-day intervals go out at the set time of day; shorter ones (`12h`) count from the last reminder.
 
 **Closing:** the poll's creator (or anyone with Manage Messages) can click 🔒 *Close poll*, which
 freezes it and announces the best day. Polls close themselves once their last day has passed.
@@ -43,7 +53,7 @@ freezes it and announces the best day. Polls close themselves once their last da
 | Dates | `next week`, `this week`, `weekend`, `next weekend`, `next 10 days`, `2 weeks`, `friday`, `next fri`, `fri-sun`, `oct 30 - nov 3`, `Oct 25-31`, `11/1-11/7`, `2026-11-01..2026-11-07` | next Mon–Sun |
 | People | `@user` and/or `@role` mentions | everyone who can see the channel (thread members, in a thread) |
 | Title | `"Anything in double quotes"` | `Game night` |
-| Reminders | `nag=12h`, `nag=daily`, `nag=off`, `no nag` | `SCHEDULE_BOT_NAG` (daily) |
+| Reminders | `nag=12h`, `nag=daily`, `nag=9am`, `nag=2d@7pm`, `nag=off`, `no nag` | `SCHEDULE_BOT_NAG` (daily) at `SCHEDULE_BOT_NAG_TIME` (6pm) |
 
 Ranges are capped at 25 days, since Discord select menus hold at most 25 options. Days that have
 already passed are dropped from the start of a range.
@@ -58,7 +68,7 @@ already passed are dropped from the start of a range.
      Without it the bot only sees whoever happens to be cached, and quietly invites too few people.
    - **Message Content Intent**: needed when someone picks the bot's *role* from the `@` autocomplete
      (it has one with the same name) instead of the bot user.
-3. **OAuth2 → URL Generator**: scope `bot`; permissions **View Channels**, **Send Messages**,
+3. **OAuth2 → URL Generator**: scopes `bot` and `applications.commands` (for `/schedule`); permissions **View Channels**, **Send Messages**,
    **Send Messages in Threads**, **Embed Links**, **Read Message History**. Open the generated URL to
    invite the bot to your server.
 
@@ -72,6 +82,7 @@ Configuration is all environment variables:
 | `SCHEDULE_BOT_TZ` | IANA timezone that decides what "today" and "next week" mean, e.g. `America/Chicago` | system timezone |
 | `SCHEDULE_BOT_DATE_ORDER` | How to read `03/04`: `MDY`, `DMY` or `YMD` | `MDY` |
 | `SCHEDULE_BOT_NAG` | Default reminder interval (`daily`, `12h`, `off`, …) | `daily` |
+| `SCHEDULE_BOT_NAG_TIME` | Time of day for whole-day reminders (`18:00`, `9am`), or `off` to count from when the poll was posted | `18:00` |
 | `SCHEDULE_BOT_DB` | SQLite database path | `$XDG_STATE_HOME/schedule_bot/schedule_bot.db` |
 
 ```sh
@@ -119,7 +130,8 @@ Layout:
 - `schedule_bot/dates.py`: date range parsing
 - `schedule_bot/invocation.py`: parsing the rest of the `@schedule_bot …` message
 - `schedule_bot/scoring.py`: per-day breakdown and ranking
+- `schedule_bot/nagging.py`: when reminders fire
 - `schedule_bot/db.py`: SQLite storage
 - `schedule_bot/render.py`: embeds and panel text
 - `schedule_bot/views.py`: buttons and menus (`DynamicItem`s, so they keep working across restarts)
-- `schedule_bot/bot.py`: the client: invocations, live message updates, reminders, closing
+- `schedule_bot/bot.py`: the client: mentions and `/schedule`, live message updates, reminders, closing

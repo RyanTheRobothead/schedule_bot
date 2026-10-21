@@ -5,26 +5,45 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 
 import discord
+from discord import app_commands
 from discord.ext import tasks
 
 from .config import Config
 from .dates import MAX_DAYS, DateRangeError, parse_date_range
 from .db import Database
-from .invocation import InvocationError, parse_invocation
+from .invocation import (
+    DEFAULT_TITLE,
+    Invocation,
+    InvocationError,
+    extract_mentions,
+    parse_invocation,
+    parse_nag,
+)
 from .models import Poll
+from .nagging import first_nag_at, next_nag_at
 from .render import closing_text, mentions, poll_embed, range_label
-from .views import CloseButton, DaySelect, DefaultSelect, FineTuneButton, StatusButton, poll_view
+from .views import (
+    CloseButton,
+    DaySelect,
+    DefaultSelect,
+    FineTuneButton,
+    SameAsLastButton,
+    StatusButton,
+    poll_view,
+)
 
 log = logging.getLogger(__name__)
 
 REFRESH_DELAY = 1.5  # seconds; coalesces bursts of clicks into one message edit
 PING_LIMIT = 50  # most people pinged in one message, to stay under the 2000-char content cap
+ALLOWED_MENTIONS = discord.AllowedMentions(everyone=False, roles=False, users=True)
 
 HELP_TEXT = f"""\
 **How to use me**
-Mention me to start a scheduling poll: `@schedule_bot [dates] [@people/@roles] ["title"] [nag=…]`
+Mention me — `@schedule_bot [dates] [@people/@roles] ["title"] [nag=…]` — or use `/schedule`.
 
 **Dates** (default: next Monday–Sunday)
 `next week` · `this week` · `weekend` · `next 10 days` · `2 weeks` · `fri-sun` · `oct 30 - nov 3` · `11/1-11/7` · `2026-11-01..2026-11-07` · `friday`
@@ -32,10 +51,13 @@ Up to {MAX_DAYS} days.
 
 **Who** — mention users and/or roles to invite just them; otherwise everyone who can see this channel is invited.
 
-**Reminders** — by default I'll ping anyone who hasn't answered once a day. `nag=12h`, `nag=2d`, or `nag=off`.
+**Reminders** — by default I'll ping anyone who hasn't answered once a day, in the evening. \
+`nag=12h`, `nag=2d`, `nag=9am` (daily at 9am), `nag=2d@7pm`, or `nag=off`.
 
-**Answering** — click your usual availability on the poll, then use the day menus that pop up for the exceptions.
+**Answering** — click your usual availability on the poll (or 🔁 to copy your last answer), then use the day menus that pop up for the exceptions.
 Example: `@schedule_bot fri-sun "One-shot" @Players nag=12h`"""
+
+SendPoll = Callable[..., Awaitable[discord.Message]]
 
 
 class ScheduleBot(discord.Client):
@@ -43,17 +65,17 @@ class ScheduleBot(discord.Client):
         intents = discord.Intents.default()
         intents.members = True  # to expand roles and list who can see a channel
         intents.message_content = True  # so mentions via the bot's role still carry text
-        super().__init__(
-            intents=intents,
-            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
-        )
+        super().__init__(intents=intents, allowed_mentions=ALLOWED_MENTIONS)
         self.config = config
         self.db = Database(config.db_path)
+        self.tree = app_commands.CommandTree(self)
+        self.tree.add_command(schedule_command)
         self._pending_refresh: set[int] = set()
         self._background: set[asyncio.Task] = set()
 
     async def setup_hook(self) -> None:
-        self.add_dynamic_items(StatusButton, FineTuneButton, CloseButton, DefaultSelect, DaySelect)
+        self.add_dynamic_items(StatusButton, SameAsLastButton, FineTuneButton, CloseButton, DefaultSelect, DaySelect)
+        await self.tree.sync()
         self.housekeeping.change_interval(minutes=self.config.housekeeping_minutes)
         self.housekeeping.start()
 
@@ -76,54 +98,99 @@ class ScheduleBot(discord.Client):
             if inv.help:
                 await message.reply(HELP_TEXT, mention_author=False)
                 return
-            start, end = parse_date_range(inv.date_text, self.config.today(), self.config.date_order)
+            users = [m for m in message.mentions if m.id != self.user.id]
+            roles = [r for r in message.role_mentions if not self._is_bot_role(r)]
+            poll = await self._prepare_poll(message.channel, message.author, inv, users, roles)
         except (DateRangeError, InvocationError) as e:
             await message.reply(f"⚠️ {e}\nSay `@{self.user.name} help` for examples.", mention_author=False)
             return
+        try:
+            sent = await self._post_poll(poll, message.channel.send)
+        except discord.HTTPException as e:
+            await message.reply(f"⚠️ I couldn't post the poll: {e.text or e}", mention_author=False)
+            return
+        log.info("Created poll %s in #%s via mention (message %s)", poll.id, message.channel, sent.id)
 
-        participants = await self._resolve_participants(message)
-        if not participants:
-            await message.reply("⚠️ I couldn't find anyone to invite.", mention_author=False)
+    async def schedule_from_interaction(
+        self, interaction: discord.Interaction, dates: str, title: str, invite: str, nag: str
+    ) -> None:
+        guild, channel = interaction.guild, interaction.channel
+        try:
+            inv = Invocation(title=title.strip() or DEFAULT_TITLE, date_text=dates)
+            if nag.strip():
+                inv.nag_seconds, inv.nag_time = parse_nag(nag)
+            user_ids, role_ids = extract_mentions(invite)
+            users = [m for uid in user_ids if (m := guild.get_member(uid)) is not None]
+            roles = [r for rid in role_ids if (r := guild.get_role(rid)) is not None and not self._is_bot_role(r)]
+            if invite.strip() and not (users or roles) and "@everyone" not in invite and "@here" not in invite:
+                raise InvocationError("I couldn't find anyone in `invite` — pick people or roles with @.")
+            poll = await self._prepare_poll(channel, interaction.user, inv, users, roles)
+        except (DateRangeError, InvocationError) as e:
+            await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
             return
 
-        nag = self.config.default_nag_seconds if inv.nag_seconds is None else inv.nag_seconds
-        poll = self.db.create_poll(
-            guild_id=message.guild.id,
-            channel_id=message.channel.id,
-            creator_id=message.author.id,
+        async def send(**kwargs) -> discord.Message:
+            await interaction.response.send_message(**kwargs, allowed_mentions=ALLOWED_MENTIONS)
+            return await interaction.original_response()
+
+        try:
+            sent = await self._post_poll(poll, send)
+        except discord.HTTPException as e:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"⚠️ I couldn't post the poll: {e.text or e}", ephemeral=True)
+            return
+        log.info("Created poll %s in #%s via /schedule (message %s)", poll.id, channel, sent.id)
+
+    async def _prepare_poll(self, channel, author: discord.abc.User, inv: Invocation, users, roles) -> Poll:
+        """Validate an invocation and store the poll (without a message yet)."""
+        start, end = parse_date_range(inv.date_text, self.config.today(), self.config.date_order)
+        participants = await self._resolve_participants(channel, users, roles)
+        if not participants:
+            raise InvocationError("I couldn't find anyone to invite.")
+
+        interval = self.config.default_nag_seconds if inv.nag_seconds is None else inv.nag_seconds
+        nag_time = inv.nag_time or self.config.default_nag_time
+        now = time.time()
+        return self.db.create_poll(
+            guild_id=channel.guild.id,
+            channel_id=channel.id,
+            creator_id=author.id,
             title=inv.title,
             start=start,
             end=end,
-            nag_interval=nag,
+            nag_interval=interval,
+            nag_time=nag_time,
+            next_nag_at=first_nag_at(now, interval, nag_time, self.config.tz),
+            created_at=now,
             participants=participants,
         )
+
+    async def _post_poll(self, poll: Poll, send: SendPoll) -> discord.Message:
+        """Post a stored poll with ``send``; the poll is deleted again if that fails."""
+        participants = self.db.participants(poll.id)
         try:
-            sent = await message.channel.send(
+            sent = await send(
                 content=f"📣 {mentions(participants, PING_LIMIT)} — when can you make **{poll.title}**?",
                 embed=poll_embed(poll, self.db.responses(poll.id)),
                 view=poll_view(poll),
             )
-        except discord.HTTPException as e:
+        except discord.HTTPException:
             self.db.delete_poll(poll.id)
-            log.exception("Failed to post poll")
-            await message.reply(f"⚠️ I couldn't post the poll: {e.text or e}", mention_author=False)
-            return
+            log.exception("Failed to post poll %s", poll.id)
+            raise
         self.db.set_message_id(poll.id, sent.id)
-        log.info("Created poll %s in #%s for %s", poll.id, message.channel, range_label(start, end))
+        return sent
 
-    async def _resolve_participants(self, message: discord.Message) -> set[int]:
-        users = [m for m in message.mentions if m.id != self.user.id]
-        roles = [r for r in message.role_mentions if not self._is_bot_role(r)]
+    async def _resolve_participants(self, channel, users, roles) -> set[int]:
         if users or roles:
             ids = {m.id for m in users if not m.bot}
             for role in roles:
                 ids.update(m.id for m in role.members if not m.bot)
             return ids
 
-        channel = message.channel
         if isinstance(channel, discord.Thread):
             thread_members = await channel.fetch_members()
-            members = [message.guild.get_member(tm.id) for tm in thread_members]
+            members = [channel.guild.get_member(tm.id) for tm in thread_members]
         else:
             members = getattr(channel, "members", [])
         return {m.id for m in members if m is not None and not m.bot}
@@ -194,7 +261,9 @@ class ScheduleBot(discord.Client):
 
     async def nag(self, poll: Poll) -> None:
         now = time.time()
-        self.db.set_next_nag(poll.id, now + poll.nag_interval)
+        self.db.set_next_nag(
+            poll.id, next_nag_at(poll.next_nag_at, now, poll.nag_interval, poll.nag_time, self.config.tz)
+        )
         waiting = [uid for uid, r in self.db.responses(poll.id).items() if not r.has_answered]
         if not waiting:
             return
@@ -222,3 +291,18 @@ class ScheduleBot(discord.Client):
     @housekeeping.before_loop
     async def _before_housekeeping(self) -> None:
         await self.wait_until_ready()
+
+
+@app_commands.command(name="schedule", description="Start a poll to find a day that works for everyone")
+@app_commands.describe(
+    dates="e.g. next week, fri-sun, oct 30 - nov 3, next 10 days (default: next Mon–Sun)",
+    title='What it\'s for, e.g. "One-shot" (default: Game night)',
+    invite="@people and/or @roles to invite (default: everyone who can see this channel)",
+    nag="Reminder interval: daily, 12h, 2d, 9am, 2d@7pm, off (default: daily, evenings)",
+)
+@app_commands.guild_only()
+async def schedule_command(
+    interaction: discord.Interaction, dates: str = "", title: str = "", invite: str = "", nag: str = ""
+) -> None:
+    bot: ScheduleBot = interaction.client  # type: ignore[assignment]
+    await bot.schedule_from_interaction(interaction, dates, title, invite, nag)

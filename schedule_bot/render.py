@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, time
 
 import discord
 
@@ -25,12 +25,19 @@ def range_label(start: date, end: date) -> str:
     return f"{day_label(start)} – {day_label(end)}"
 
 
-def nag_label(seconds: int) -> str:
+def time_label(t: time) -> str:
+    """18:00 -> '6pm', 09:30 -> '9:30am'."""
+    minutes = f":{t.minute:02d}" if t.minute else ""
+    return f"{t.hour % 12 or 12}{minutes}{'am' if t.hour < 12 else 'pm'}"
+
+
+def nag_label(seconds: int, nag_time: time | None = None) -> str:
     if not seconds:
         return "off"
     if seconds % 86400 == 0:
         days = seconds // 86400
-        return "daily" if days == 1 else f"every {days} days"
+        label = "daily" if days == 1 else f"every {days} days"
+        return f"{label} at {time_label(nag_time)}" if nag_time else label
     if seconds % 3600 == 0:
         hours = seconds // 3600
         return "hourly" if hours == 1 else f"every {hours}h"
@@ -109,7 +116,7 @@ def poll_embed(poll: Poll, responses: dict[int, UserResponse]) -> discord.Embed:
 
     legend = "  ".join(f"{s.emoji} {s.label}" for s in STATUS_ORDER) + f"  {NO_ANSWER_EMOJI} No answer"
     if not poll.closed:
-        legend += f"  •  Reminders: {nag_label(poll.nag_interval)}"
+        legend += f"  •  Reminders: {nag_label(poll.nag_interval, poll.nag_time)}"
     embed.set_footer(text=legend)
     return embed
 

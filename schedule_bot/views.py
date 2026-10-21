@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import discord
 
-from .models import STATUS_ORDER, Poll, Status, UserResponse
+from .models import STATUS_ORDER, Poll, Status, UserResponse, carry_over
 from .render import day_label, panel_text
 
 if TYPE_CHECKING:
@@ -37,6 +37,7 @@ def poll_view(poll: Poll) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     for status in STATUS_ORDER:
         view.add_item(StatusButton(poll.id, status))
+    view.add_item(SameAsLastButton(poll.id))
     view.add_item(FineTuneButton(poll.id))
     view.add_item(CloseButton(poll.id))
     return view
@@ -92,13 +93,50 @@ class StatusButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sched:s
         bot.request_refresh(poll.id)
 
 
+class SameAsLastButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sched:last:(?P<poll>\d+)"):
+    """Copies the clicker's answer from their previous poll in this server, matched up by weekday."""
+
+    def __init__(self, poll_id: int):
+        super().__init__(
+            discord.ui.Button(
+                label="Same as last time",
+                emoji="🔁",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"sched:last:{poll_id}",
+            ),
+            row=1,
+        )
+        self.poll_id = poll_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["poll"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        bot: ScheduleBot = interaction.client  # type: ignore[assignment]
+        poll = await bot.open_poll_for(interaction, self.poll_id)
+        if poll is None:
+            return
+        previous = bot.db.previous_answer(poll.guild_id, interaction.user.id, poll.id)
+        if previous is None:
+            await interaction.response.send_message(
+                "I don't have an earlier answer from you in this server yet — pick one of the status buttons instead.",
+                ephemeral=True,
+            )
+            return
+        previous_poll, previous_response = previous
+        bot.db.replace_response(poll.id, interaction.user.id, carry_over(previous_poll.days, previous_response, poll.days))
+        await _send_panel(interaction, poll, edit=False)
+        bot.request_refresh(poll.id)
+
+
 class FineTuneButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sched:panel:(?P<poll>\d+)"):
     """Opens the clicker's panel without changing anything."""
 
     def __init__(self, poll_id: int):
         super().__init__(
             discord.ui.Button(
-                label="Fine-tune days / view my answers",
+                label="Fine-tune days",
                 emoji="🗓️",
                 style=discord.ButtonStyle.secondary,
                 custom_id=f"sched:panel:{poll_id}",

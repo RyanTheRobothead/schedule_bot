@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from datetime import date
+from datetime import date, time as dtime
 from pathlib import Path
 
 from .models import Poll, Status, UserResponse
@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS polls (
     nag_interval INTEGER NOT NULL,
     next_nag_at  REAL,
     closed       INTEGER NOT NULL DEFAULT 0,
-    created_at   REAL NOT NULL
+    created_at   REAL NOT NULL,
+    nag_time     TEXT
 );
 CREATE TABLE IF NOT EXISTS participants (
     poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
@@ -53,6 +54,13 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(polls)")}
+        if "nag_time" not in columns:  # added in 0.2
+            with self.conn:
+                self.conn.execute("ALTER TABLE polls ADD COLUMN nag_time TEXT")
 
     # --- polls -------------------------------------------------------------
 
@@ -67,12 +75,14 @@ class Database:
         end: date,
         nag_interval: int,
         participants: set[int],
+        next_nag_at: float | None = None,
+        nag_time: dtime | None = None,
+        created_at: float | None = None,
     ) -> Poll:
-        now = time.time()
         with self.conn:
             cur = self.conn.execute(
                 "INSERT INTO polls (guild_id, channel_id, creator_id, title, start_date, end_date,"
-                " nag_interval, next_nag_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " nag_interval, next_nag_at, created_at, nag_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     guild_id,
                     channel_id,
@@ -81,8 +91,9 @@ class Database:
                     start.isoformat(),
                     end.isoformat(),
                     nag_interval,
-                    now + nag_interval if nag_interval else None,
-                    now,
+                    next_nag_at,
+                    time.time() if created_at is None else created_at,
+                    nag_time.strftime("%H:%M") if nag_time else None,
                 ),
             )
             poll_id = cur.lastrowid
@@ -152,9 +163,33 @@ class Database:
                 [(poll_id, user_id, d.isoformat(), int(status)) for d in days],
             )
 
-    def clear_overrides(self, poll_id: int, user_id: int) -> None:
+    def replace_response(self, poll_id: int, user_id: int, response: UserResponse) -> None:
+        self.add_participant(poll_id, user_id)
         with self.conn:
+            self.conn.execute("DELETE FROM defaults WHERE poll_id = ? AND user_id = ?", (poll_id, user_id))
             self.conn.execute("DELETE FROM overrides WHERE poll_id = ? AND user_id = ?", (poll_id, user_id))
+            if response.default is not None:
+                self.conn.execute(
+                    "INSERT INTO defaults (poll_id, user_id, status) VALUES (?, ?, ?)",
+                    (poll_id, user_id, int(response.default)),
+                )
+            self.conn.executemany(
+                "INSERT INTO overrides (poll_id, user_id, day, status) VALUES (?, ?, ?, ?)",
+                [(poll_id, user_id, d.isoformat(), int(s)) for d, s in response.overrides.items()],
+            )
+
+    def previous_answer(self, guild_id: int, user_id: int, before_poll_id: int) -> tuple[Poll, UserResponse] | None:
+        """The user's answer to the most recent earlier poll in this server they responded to."""
+        row = self.conn.execute(
+            "SELECT * FROM polls WHERE guild_id = ? AND id < ? AND ("
+            " EXISTS (SELECT 1 FROM defaults d WHERE d.poll_id = polls.id AND d.user_id = ?)"
+            " OR EXISTS (SELECT 1 FROM overrides o WHERE o.poll_id = polls.id AND o.user_id = ?)"
+            ") ORDER BY id DESC LIMIT 1",
+            (guild_id, before_poll_id, user_id, user_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_poll(row), self.response(row["id"], user_id)
 
     def response(self, poll_id: int, user_id: int) -> UserResponse:
         return self.responses(poll_id).get(user_id, UserResponse())
@@ -184,4 +219,5 @@ def _row_to_poll(row: sqlite3.Row) -> Poll:
         nag_interval=row["nag_interval"],
         next_nag_at=row["next_nag_at"],
         closed=bool(row["closed"]),
+        nag_time=dtime.fromisoformat(row["nag_time"]) if row["nag_time"] else None,
     )

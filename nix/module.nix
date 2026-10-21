@@ -36,6 +36,16 @@ in
       description = "Timezone used to decide what \"today\" and \"next week\" mean.";
     };
 
+    nagTime = lib.mkOption {
+      type = lib.types.str;
+      default = "18:00";
+      example = "9am";
+      description = ''
+        Time of day that daily (or every-N-days) reminders go out, in `timezone`.
+        `"off"` makes reminders relative to when each poll was posted.
+      '';
+    };
+
     dateOrder = lib.mkOption {
       type = lib.types.enum [
         "MDY"
@@ -57,6 +67,7 @@ in
         SCHEDULE_BOT_DB = "/var/lib/schedule-bot/schedule_bot.db";
         SCHEDULE_BOT_TZ = cfg.timezone;
         SCHEDULE_BOT_DATE_ORDER = cfg.dateOrder;
+        SCHEDULE_BOT_NAG_TIME = cfg.nagTime;
       };
       serviceConfig = {
         ExecStart = lib.getExe cfg.package;

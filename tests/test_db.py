@@ -83,3 +83,85 @@ def test_breakdown_labels_who_is_out_or_maybe():
     responses = {1: UserResponse(Status.AVAILABLE), 2: UserResponse(Status.UNAVAILABLE), 3: UserResponse(Status.TENTATIVE)}
     (line,) = breakdown_lines(summarize(D[:1], responses), None)
     assert line.endswith("— out: <@2> · maybe: <@3>")
+
+
+def test_migrates_pre_nag_time_database(tmp_path):
+    import sqlite3
+
+    from schedule_bot import db as dbmod
+
+    path = tmp_path / "old.db"
+    old_schema = dbmod.SCHEMA.replace(",\n    nag_time     TEXT\n", "\n")
+    assert "nag_time" not in old_schema
+    conn = sqlite3.connect(path)
+    conn.executescript(old_schema)
+    conn.execute(
+        "INSERT INTO polls (guild_id, channel_id, message_id, creator_id, title, start_date, end_date,"
+        " nag_interval, next_nag_at, created_at) VALUES (1, 2, 3, 4, 'Old', '2026-10-26', '2026-11-01', 86400, 5, 6)"
+    )
+    conn.commit()
+    conn.close()
+
+    (poll,) = Database(path).open_polls()
+    assert poll.title == "Old" and poll.nag_time is None
+    Database(path)  # reopening an already-migrated database is fine
+
+
+def test_nag_time_round_trip():
+    from datetime import time
+
+    db = Database(":memory:")
+    poll = db.create_poll(
+        guild_id=1, channel_id=2, creator_id=3, title="T", start=D[0], end=D[-1],
+        nag_interval=86400, nag_time=time(18, 30), next_nag_at=123.0, participants={3},
+    )  # fmt: skip
+    assert (poll.nag_time, poll.next_nag_at) == (time(18, 30), 123.0)
+
+
+def test_same_as_last_time():
+    from schedule_bot.models import UserResponse, carry_over
+
+    db = Database(":memory:")
+    first = make_poll(db)  # Mon Oct 26 - Sun Nov 1
+    db.set_default(first.id, 11, Status.AVAILABLE)
+    db.set_days_for_status(first.id, 11, Status.UNAVAILABLE, [D[1]])  # Tuesday
+    db.set_days_for_status(first.id, 11, Status.PREFERRED, [D[4]])  # Friday
+    other_guild = db.create_poll(
+        guild_id=999, channel_id=2, creator_id=10, title="Elsewhere", start=D[0], end=D[-1],
+        nag_interval=0, participants={11},
+    )  # fmt: skip
+    db.set_default(other_guild.id, 11, Status.UNAVAILABLE)
+    second = db.create_poll(
+        guild_id=1, channel_id=2, creator_id=10, title="Next", start=D[-1] + timedelta(days=1),
+        end=D[-1] + timedelta(days=7), nag_interval=0, participants={11},
+    )  # fmt: skip
+
+    assert db.previous_answer(1, 12, second.id) is None
+    prev_poll, prev_resp = db.previous_answer(1, 11, second.id)
+    assert prev_poll.id == first.id
+
+    db.replace_response(second.id, 11, carry_over(prev_poll.days, prev_resp, second.days))
+    r = db.response(second.id, 11)
+    assert r.default == Status.AVAILABLE
+    assert {d.strftime("%a"): s for d, s in r.overrides.items()} == {"Tue": Status.UNAVAILABLE, "Fri": Status.PREFERRED}
+
+
+def test_carry_over_latest_weekday_wins():
+    from schedule_bot.models import UserResponse, carry_over
+
+    two_weeks = [D[0] + timedelta(days=i) for i in range(14)]
+    prev = UserResponse(Status.AVAILABLE, {two_weeks[1]: Status.UNAVAILABLE, two_weeks[9]: Status.TENTATIVE})
+    # Tue of week 1 unavailable, Tue of week 2 tentative -> tentative; Wed of week 2 had no override
+    new = carry_over(two_weeks, prev, [D[0] + timedelta(days=14 + i) for i in range(7)])
+    assert list(new.overrides.values()) == [Status.TENTATIVE]
+
+
+def test_nag_label():
+    from datetime import time
+
+    from schedule_bot.render import nag_label
+
+    assert nag_label(86400, time(18)) == "daily at 6pm"
+    assert nag_label(172800, time(9, 30)) == "every 2 days at 9:30am"
+    assert nag_label(43200, time(18)) == "every 12h"
+    assert nag_label(0, time(18)) == "off"
