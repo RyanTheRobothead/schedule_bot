@@ -50,6 +50,7 @@ class Poll:
     closed: bool
     nag_time: time | None = None  # wall-clock time for whole-day intervals
     recurrence_id: int | None = None
+    skipped: bool = False  # closed via "skip this time" rather than to pick a day
 
     @property
     def days(self) -> list[date]:

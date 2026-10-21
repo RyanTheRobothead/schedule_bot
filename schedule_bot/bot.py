@@ -46,10 +46,14 @@ from .views import (
     DefaultSelect,
     FineTuneButton,
     SameAsLastButton,
+    SkipNextButton,
+    SkipPollButton,
     StatusButton,
     StopRepeatingButton,
+    UndoSkipButton,
     poll_view,
     recurrence_view,
+    recurring_list_view,
 )
 
 log = logging.getLogger(__name__)
@@ -73,7 +77,8 @@ Up to {MAX_DAYS} days.
 
 **Repeating** — add `every week`, `every 2 weeks`, `every other week`, `every friday` or `every weekend` and I'll post a fresh poll \
 for each period automatically, {DEFAULT_LEAD_DAYS} days ahead at {time_label(DEFAULT_POST_TIME)} unless you say `lead=2d`, `lead=1w`, or `lead=3d@9am`. \
-`@schedule_bot recurring` (or `/recurring`) lists them; each has a 🛑 button to stop it.
+`@schedule_bot recurring` (or `/recurring`) lists them, with buttons to ⏭️ skip the next one or 🛑 stop it. \
+A repeating poll that's already up has its own ⏭️ **Skip this time** button.
 
 **Answering** — click your usual availability on the poll (or 🔁 to copy your last answer), then use the day menus that pop up for the exceptions.
 Example: `@schedule_bot fri-sun "One-shot" @Players nag=12h`
@@ -103,7 +108,16 @@ class ScheduleBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self.add_dynamic_items(
-            StatusButton, SameAsLastButton, FineTuneButton, CloseButton, DefaultSelect, DaySelect, StopRepeatingButton
+            StatusButton,
+            SameAsLastButton,
+            FineTuneButton,
+            CloseButton,
+            DefaultSelect,
+            DaySelect,
+            StopRepeatingButton,
+            SkipPollButton,
+            SkipNextButton,
+            UndoSkipButton,
         )
         await self.tree.sync()
         # dateparser loads its locale data on first use; do it now rather than inside
@@ -340,7 +354,7 @@ class ScheduleBot(discord.Client):
         ]
         return dict(
             content=LIST_HEADER + "\n" + "\n".join(lines)[:1900],
-            view=recurrence_view([r.id for r in recs], labelled=True),
+            view=recurring_list_view(recs),  # buttons for the first 5; Discord allows 5 rows
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -404,32 +418,108 @@ class ScheduleBot(discord.Client):
 
         self.db.set_recurrence_period(rec.id, next_period(start, rec.interval_weeks))
 
-    async def stop_recurrence(self, interaction: discord.Interaction, recurrence_id: int) -> None:
+    async def _check_manager(self, interaction: discord.Interaction, creator_id: int, what: str) -> bool:
+        """Creator or moderator only; tells anyone else so."""
+        if interaction.user.id == creator_id or interaction.permissions.manage_messages:
+            return True
+        await interaction.response.send_message(f"Only <@{creator_id}> (or a moderator) can {what}.", ephemeral=True)
+        return False
+
+    async def _active_recurrence_for(self, interaction: discord.Interaction, recurrence_id: int):
         rec = self.db.get_recurrence(recurrence_id)
         if rec is None or not rec.active:
-            await interaction.response.send_message("That poll has already stopped repeating.", ephemeral=True)
+            await interaction.response.send_message("That poll has stopped repeating.", ephemeral=True)
+            return None
+        return rec
+
+    async def _announce_from_button(self, interaction: discord.Interaction, rec: Recurrence, notice: dict) -> None:
+        """Post ``notice`` publicly, updating a /recurring list or confirmation the button was on."""
+        message = interaction.message
+        if message is None or self.db.poll_by_message(message.id) is not None:
+            await interaction.response.send_message(**notice)  # polls refresh themselves
             return
-        if interaction.user.id != rec.creator_id and not interaction.permissions.manage_messages:
-            await interaction.response.send_message(
-                f"Only <@{rec.creator_id}> (or a moderator) can stop this.", ephemeral=True
-            )
+        if message.content.startswith((LIST_HEADER, NO_RECURRING)):
+            await interaction.response.edit_message(**{"view": None, **self._recurring_list(rec.guild_id)})
+        else:  # a "Got it" confirmation or an earlier skip notice
+            await interaction.response.edit_message(view=None)
+        await interaction.followup.send(**notice)
+
+    async def stop_recurrence(self, interaction: discord.Interaction, recurrence_id: int) -> None:
+        rec = await self._active_recurrence_for(interaction, recurrence_id)
+        if rec is None or not await self._check_manager(interaction, rec.creator_id, "stop this"):
             return
         self.db.deactivate_recurrence(rec.id)
+        rec.active = False
         notice = dict(
             content=f"🛑 {interaction.user.mention} stopped repeating **{rec.title}**. Polls already posted stay open.",
             allowed_mentions=discord.AllowedMentions.none(),
         )
-        message = interaction.message
-        if message is None or self.db.poll_by_message(message.id) is not None:
-            await interaction.response.send_message(**notice)  # the poll itself refreshes below
-        else:
-            if message.content.startswith((LIST_HEADER, NO_RECURRING)):
-                await interaction.response.edit_message(**{"view": None, **self._recurring_list(rec.guild_id)})
-            else:  # the "Got it" confirmation
-                await interaction.response.edit_message(view=None)
-            await interaction.followup.send(**notice)
+        await self._announce_from_button(interaction, rec, notice)
         for poll in self.db.open_polls_for_recurrence(rec.id):
             self.request_refresh(poll.id)
+
+    def _next_post_text(self, rec: Recurrence) -> str:
+        when = when_label(max(time.time(), post_at(rec.period_start, rec.lead_days, rec.post_time, self.config.tz)), self.config.tz)
+        return f"The next poll goes out {when}, for {range_label(rec.period_start, rec.period_end)}."
+
+    async def skip_poll(self, interaction: discord.Interaction, poll_id: int) -> None:
+        """Close an already-posted repeating poll as skipped."""
+        poll = await self.open_poll_for(interaction, poll_id)
+        if poll is None or not await self._check_manager(interaction, poll.creator_id, "skip this one"):
+            return
+        self.db.close_poll(poll.id, skipped=True)
+        rec = self.db.get_recurrence(poll.recurrence_id) if poll.recurrence_id else None
+        after = f" {self._next_post_text(rec)}" if rec is not None and rec.active else ""
+        await interaction.response.send_message(
+            f"⏭️ {interaction.user.mention} skipped **{poll.title}** this time "
+            f"({range_label(poll.start, poll.end)}); no more reminders for it.{after}",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await self._edit_poll_message(self.db.get_poll(poll.id))
+
+    async def skip_next(self, interaction: discord.Interaction, recurrence_id: int) -> None:
+        """Skip a recurrence's next period before its poll is posted."""
+        rec = await self._active_recurrence_for(interaction, recurrence_id)
+        if rec is None or not await self._check_manager(interaction, rec.creator_id, "skip this"):
+            return
+        async with self._recurrence_locks.setdefault(rec.id, asyncio.Lock()):
+            rec = self.db.get_recurrence(rec.id)
+            start = catch_up(rec.period_start, rec.period_days, rec.interval_weeks, self.config.today())
+            if self.db.recurrence_has_poll(rec.id, start + (rec.period_end - rec.period_start)):
+                start = next_period(start, rec.interval_weeks)  # already posted: use that poll's skip button
+            rec.period_start = next_period(start, rec.interval_weeks)
+            self.db.set_recurrence_period(rec.id, rec.period_start)
+        skipped_end = start + (rec.period_end - rec.period_start)
+        notice = dict(
+            content=f"⏭️ {interaction.user.mention} skipped **{rec.title}** for {range_label(start, skipped_end)}. "
+            + self._next_post_text(rec),
+            view=discord.ui.View(timeout=None).add_item(UndoSkipButton(rec.id, start)),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await self._announce_from_button(interaction, rec, notice)
+
+    async def undo_skip(self, interaction: discord.Interaction, recurrence_id: int, skipped_start) -> None:
+        rec = await self._active_recurrence_for(interaction, recurrence_id)
+        if rec is None or not await self._check_manager(interaction, rec.creator_id, "undo this"):
+            return
+        async with self._recurrence_locks.setdefault(rec.id, asyncio.Lock()):
+            rec = self.db.get_recurrence(rec.id)
+            skipped_end = skipped_start + (rec.period_end - rec.period_start)
+            if (
+                rec.period_start != next_period(skipped_start, rec.interval_weeks)
+                or skipped_end < self.config.today()
+                or self.db.recurrence_has_poll(rec.id, skipped_end)
+            ):
+                await interaction.response.send_message("It's too late to undo that skip.", ephemeral=True)
+                return
+            self.db.set_recurrence_period(rec.id, skipped_start)
+        await interaction.response.edit_message(view=None)
+        await interaction.followup.send(
+            f"↩️ {interaction.user.mention} un-skipped **{rec.title}** for "
+            f"{range_label(skipped_start, skipped_end)}. " + self._next_post_text(self.db.get_recurrence(rec.id)),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        await self._run_recurrence(rec)  # posts right away if it's already due
 
     # --- interactions helpers ---------------------------------------------
 

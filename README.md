@@ -71,8 +71,14 @@ Add a repeat phrase and the bot posts a fresh poll for every period on its own:
   none of them are left, the repeat stops itself and says so.
 - Reminders follow the usual rules for each poll. A poll posted at 6pm won't nag the same evening,
   because the first reminder waits at least 6 hours.
+- **⏭️ Skipping one:** on a repeating poll that's already up, **Skip this time** closes it as
+  skipped: no more reminders, no "best day" announcement, and the next one comes as usual. To skip
+  one that hasn't gone out yet, use its **skip** button in the `/recurring` list. The notice has an
+  **↩️ Undo** button that works until that period's poll would have been needed.
 - **🛑 Stop repeating** is on the confirmation, on each repeating poll, and in the `/recurring` list.
-  The creator or anyone with Manage Messages can use it. Polls already posted stay open.
+  Polls already posted stay open.
+- Skipping, stopping and closing are for the creator or anyone with Manage Messages. The `/recurring`
+  list has buttons for the first five repeats.
 
 With `/schedule`, pick a `repeat` (every 1–4 weeks) and optionally a `lead`.
 

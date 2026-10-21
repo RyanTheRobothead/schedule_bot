@@ -91,12 +91,13 @@ def when_label(epoch: float, tz) -> str:
 
 
 def recurrence_line(rec: Recurrence, next_post: float, tz) -> str:
+    """One line of the /recurring list. ``rec.period_start`` is the next period to be posted."""
     who = mentions(rec.user_ids) + (" " if rec.user_ids and rec.role_ids else "")
     who += " ".join(f"<@&{rid}>" for rid in sorted(rec.role_ids))
     return (
         f"**#{rec.id} {rec.title}**: {period_label(rec.period_start, rec.period_days)}, "
         f"{repeat_label(rec.interval_weeks)}, in <#{rec.channel_id}> for {who or 'everyone in the channel'}. "
-        f"Next poll {when_label(next_post, tz)}."
+        f"Next poll {when_label(next_post, tz)}, for {range_label(rec.period_start, rec.period_end)}."
     )
 
 
@@ -107,7 +108,12 @@ def poll_embed(poll: Poll, responses: dict[int, UserResponse], repeat_note: str 
     answered = {uid for uid, r in responses.items() if r.has_answered}
     waiting = set(responses) - answered
 
-    title = f"📅 {poll.title}" if not poll.closed else f"🔒 {poll.title} (closed)"
+    if poll.skipped:
+        title = f"⏭️ {poll.title} (skipped this time)"
+    elif poll.closed:
+        title = f"🔒 {poll.title} (closed)"
+    else:
+        title = f"📅 {poll.title}"
     header = f"**{range_label(poll.start, poll.end)}**\n"
     if not poll.closed:
         header += "Click your usual availability below, then fine-tune any days that differ.\n"

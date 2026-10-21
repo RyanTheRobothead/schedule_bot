@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING
 
 import discord
 
-from .models import STATUS_ORDER, Poll, Status, UserResponse, carry_over
-from .render import day_label, panel_text
+from .models import STATUS_ORDER, Poll, Recurrence, Status, UserResponse, carry_over
+from .render import day_label, panel_text, range_label
 
 if TYPE_CHECKING:
     from .bot import ScheduleBot
@@ -43,16 +43,28 @@ def poll_view(poll: Poll, repeating_id: int | None = None) -> discord.ui.View:
     view.add_item(SameAsLastButton(poll.id))
     view.add_item(FineTuneButton(poll.id))
     view.add_item(CloseButton(poll.id))
+    if poll.recurrence_id is not None:
+        view.add_item(SkipPollButton(poll.id))
     if repeating_id is not None:
         view.add_item(StopRepeatingButton(repeating_id, row=1))
     return view
 
 
-def recurrence_view(recurrence_ids: list[int], labelled: bool = False) -> discord.ui.View:
-    """Stop buttons for one or more recurrences (labelled by id when there are several)."""
+def recurrence_view(recurrence_ids: list[int]) -> discord.ui.View:
+    """The stop button under a "Got it" confirmation."""
     view = discord.ui.View(timeout=None)
     for rid in recurrence_ids[:25]:
-        view.add_item(StopRepeatingButton(rid, label=f"Stop #{rid}" if labelled else None))
+        view.add_item(StopRepeatingButton(rid))
+    return view
+
+
+def recurring_list_view(recs: list[Recurrence]) -> discord.ui.View:
+    """A row per recurrence in the /recurring list: skip its next period, or stop it."""
+    view = discord.ui.View(timeout=None)
+    for row, rec in enumerate(recs[:5]):
+        dates = range_label(rec.period_start, rec.period_end)
+        view.add_item(SkipNextButton(rec.id, label=f"#{rec.id}: skip {dates}", row=row))
+        view.add_item(StopRepeatingButton(rec.id, label=f"Stop #{rec.id}", row=row))
     return view
 
 
@@ -299,3 +311,78 @@ class StopRepeatingButton(discord.ui.DynamicItem[discord.ui.Button], template=r"
     async def callback(self, interaction: discord.Interaction) -> None:
         bot: ScheduleBot = interaction.client  # type: ignore[assignment]
         await bot.stop_recurrence(interaction, self.recurrence_id)
+
+
+class SkipPollButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sched:pskip:(?P<poll>\d+)"):
+    """Closes one repeating poll as "skipped this time"; the next one still comes as usual."""
+
+    def __init__(self, poll_id: int):
+        super().__init__(
+            discord.ui.Button(
+                label="Skip this time",
+                emoji="⏭️",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"sched:pskip:{poll_id}",
+            ),
+            row=1,
+        )
+        self.poll_id = poll_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["poll"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        bot: ScheduleBot = interaction.client  # type: ignore[assignment]
+        await bot.skip_poll(interaction, self.poll_id)
+
+
+class SkipNextButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sched:rskip:(?P<rec>\d+)"):
+    """Skips a recurrence's next period before its poll goes out."""
+
+    def __init__(self, recurrence_id: int, label: str | None = None, row: int | None = None):
+        super().__init__(
+            discord.ui.Button(
+                label=label or "Skip next",
+                emoji="⏭️",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"sched:rskip:{recurrence_id}",
+            ),
+            row=row,
+        )
+        self.recurrence_id = recurrence_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["rec"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        bot: ScheduleBot = interaction.client  # type: ignore[assignment]
+        await bot.skip_next(interaction, self.recurrence_id)
+
+
+class UndoSkipButton(
+    discord.ui.DynamicItem[discord.ui.Button], template=r"sched:runskip:(?P<rec>\d+):(?P<start>\d{8})"
+):
+    """Puts back a period skipped with SkipNextButton, if its poll hasn't been needed yet."""
+
+    def __init__(self, recurrence_id: int, skipped_start: date):
+        super().__init__(
+            discord.ui.Button(
+                label="Undo",
+                emoji="↩️",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"sched:runskip:{recurrence_id}:{skipped_start:%Y%m%d}",
+            )
+        )
+        self.recurrence_id = recurrence_id
+        self.skipped_start = skipped_start
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        s = match["start"]
+        return cls(int(match["rec"]), date(int(s[:4]), int(s[4:6]), int(s[6:])))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        bot: ScheduleBot = interaction.client  # type: ignore[assignment]
+        await bot.undo_skip(interaction, self.recurrence_id, self.skipped_start)

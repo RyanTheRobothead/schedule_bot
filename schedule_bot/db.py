@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS polls (
     closed       INTEGER NOT NULL DEFAULT 0,
     created_at   REAL NOT NULL,
     nag_time     TEXT,
-    recurrence_id INTEGER REFERENCES recurrences(id)
+    recurrence_id INTEGER REFERENCES recurrences(id),
+    skipped      INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS recurrences (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,6 +84,9 @@ class Database:
         if "recurrence_id" not in columns:  # added in 0.3
             with self.conn:
                 self.conn.execute("ALTER TABLE polls ADD COLUMN recurrence_id INTEGER REFERENCES recurrences(id)")
+        if "skipped" not in columns:  # added in 0.4
+            with self.conn:
+                self.conn.execute("ALTER TABLE polls ADD COLUMN skipped INTEGER NOT NULL DEFAULT 0")
 
     # --- polls -------------------------------------------------------------
 
@@ -161,9 +165,11 @@ class Database:
         with self.conn:
             self.conn.execute("UPDATE polls SET next_nag_at = ? WHERE id = ?", (when, poll_id))
 
-    def close_poll(self, poll_id: int) -> None:
+    def close_poll(self, poll_id: int, skipped: bool = False) -> None:
         with self.conn:
-            self.conn.execute("UPDATE polls SET closed = 1, next_nag_at = NULL WHERE id = ?", (poll_id,))
+            self.conn.execute(
+                "UPDATE polls SET closed = 1, next_nag_at = NULL, skipped = ? WHERE id = ?", (int(skipped), poll_id)
+            )
 
     def delete_poll(self, poll_id: int) -> None:
         with self.conn:
@@ -329,6 +335,7 @@ def _row_to_poll(row: sqlite3.Row) -> Poll:
         closed=bool(row["closed"]),
         nag_time=dtime.fromisoformat(row["nag_time"]) if row["nag_time"] else None,
         recurrence_id=row["recurrence_id"],
+        skipped=bool(row["skipped"]),
     )
 
 

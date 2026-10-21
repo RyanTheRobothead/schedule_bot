@@ -204,3 +204,119 @@ def test_stopped_recurrence_does_not_post(clock, monkeypatch):
     clock(2026, 10, 22, 18, 2)
     asyncio.run(bot._run_recurrence(rec))  # stale object still says active
     assert polls(bot) == []
+
+
+class FakeResponse:
+    def __init__(self, log):
+        self.log = log
+
+    async def send_message(self, content=None, **kwargs):
+        self.log.append(("send", content, kwargs))
+
+    async def edit_message(self, **kwargs):
+        self.log.append(("edit", kwargs.get("content"), kwargs))
+
+
+class FakeFollowup:
+    def __init__(self, log):
+        self.log = log
+
+    async def send(self, content=None, **kwargs):
+        self.log.append(("followup", content, kwargs))
+
+
+def interaction(user_id=11, moderator=False, message_content=None):
+    log = []
+    return SimpleNamespace(
+        user=SimpleNamespace(id=user_id, mention=f"<@{user_id}>"),
+        permissions=SimpleNamespace(manage_messages=moderator),
+        message=SimpleNamespace(id=next(_ids), content=message_content) if message_content is not None else None,
+        response=FakeResponse(log),
+        followup=FakeFollowup(log),
+        log=log,
+    )
+
+
+def test_skip_next_then_undo(clock, monkeypatch):
+    channel = FakeChannel()
+    bot = make_bot(channel, monkeypatch)
+    clock(2026, 10, 20, 12)
+    rec = create(bot, channel, "<@1> every week")
+
+    it = interaction(message_content=bot_module.LIST_HEADER)
+    asyncio.run(bot.skip_next(it, rec.id))
+    assert bot.db.get_recurrence(rec.id).period_start == date(2026, 11, 2)
+    (edit, notice) = it.log
+    assert edit[0] == "edit" and "Nov 2 – Sun Nov 8" in edit[1]  # list re-rendered
+    assert "skipped **Game night** for Mon Oct 26 – Sun Nov 1" in notice[1]
+    assert "next poll goes out Thu Oct 29 at 6pm" in notice[1]
+
+    clock(2026, 10, 22, 18, 2)  # Thursday's post time passes: nothing goes out for the skipped week
+    run(bot, rec.id)
+    assert polls(bot) == []
+
+    undo = interaction(message_content="⏭️ skipped")
+    asyncio.run(bot.undo_skip(undo, rec.id, date(2026, 10, 26)))
+    assert "un-skipped" in undo.log[-1][1]
+    assert [tuple(r)[:2] for r in polls(bot)] == [("2026-10-26", "2026-11-01")]  # already due, so posted
+
+    again = interaction(message_content="⏭️ skipped")
+    asyncio.run(bot.undo_skip(again, rec.id, date(2026, 10, 26)))
+    assert again.log == [("send", "It's too late to undo that skip.", {"ephemeral": True})]
+
+
+def test_skip_next_needs_creator_or_moderator(clock, monkeypatch):
+    channel = FakeChannel()
+    bot = make_bot(channel, monkeypatch)
+    clock(2026, 10, 20, 12)
+    rec = create(bot, channel, "<@1> every week")
+    stranger = interaction(user_id=12, message_content=bot_module.LIST_HEADER)
+    asyncio.run(bot.skip_next(stranger, rec.id))
+    assert bot.db.get_recurrence(rec.id).period_start == date(2026, 10, 26)
+    assert "Only <@11>" in stranger.log[0][1]
+    asyncio.run(bot.skip_next(interaction(user_id=12, moderator=True, message_content=""), rec.id))
+    assert bot.db.get_recurrence(rec.id).period_start == date(2026, 11, 2)
+
+
+def test_skip_this_time_closes_the_posted_poll(clock, monkeypatch):
+    channel = FakeChannel()
+    bot = make_bot(channel, monkeypatch)
+    clock(2026, 10, 20, 12)
+    rec = create(bot, channel, "<@1> every week")
+    clock(2026, 10, 22, 18, 2)
+    run(bot, rec.id)
+    (poll,) = bot.db.open_polls()
+
+    edits = []
+
+    async def fake_edit(p):
+        edits.append(p)
+
+    monkeypatch.setattr(bot, "_edit_poll_message", fake_edit)
+    it = interaction()
+    asyncio.run(bot.skip_poll(it, poll.id))
+    skipped = bot.db.get_poll(poll.id)
+    assert skipped.closed and skipped.skipped and skipped.next_nag_at is None
+    assert "skipped **Game night** this time" in it.log[0][1]
+    assert "next poll goes out Thu Oct 29 at 6pm, for Mon Nov 2 – Sun Nov 8" in it.log[0][1]
+    assert edits[0].skipped
+    assert bot._render_poll(skipped)[0].title == "⏭️ Game night (skipped this time)"
+    assert bot.db.get_recurrence(rec.id).active  # only this one is skipped
+
+
+def test_repeating_poll_has_skip_button(clock, monkeypatch):
+    channel = FakeChannel()
+    bot = make_bot(channel, monkeypatch)
+    clock(2026, 10, 20, 12)
+    rec = create(bot, channel, "<@1> every week")
+    clock(2026, 10, 22, 18, 2)
+    run(bot, rec.id)
+    rows = channel.sent[0].view.to_components()
+    assert [c["label"] for c in rows[1]["components"]] == [
+        "Same as last time", "Fine-tune days", "Close poll", "Skip this time", "Stop repeating",
+    ]  # fmt: skip
+    async def list_components():  # views need a running event loop
+        return bot._recurring_list(1)["view"].to_components()
+
+    listing = asyncio.run(list_components())
+    assert [c["label"] for c in listing[0]["components"]] == [f"#{rec.id}: skip Mon Nov 2 – Sun Nov 8", f"Stop #{rec.id}"]
