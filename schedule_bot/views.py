@@ -118,14 +118,14 @@ class SameAsLastButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sch
         if poll is None:
             return
         previous = bot.db.previous_answer(poll.guild_id, interaction.user.id, poll.id)
-        if previous is None:
+        carried = carry_over(previous[0].days, previous[1], poll.days) if previous else None
+        if carried is None or not carried.has_answered:
             await interaction.response.send_message(
-                "I don't have an earlier answer from you in this server yet — pick one of the status buttons instead.",
+                "I don't have an earlier answer from you that fits these days — pick one of the status buttons instead.",
                 ephemeral=True,
             )
             return
-        previous_poll, previous_response = previous
-        bot.db.replace_response(poll.id, interaction.user.id, carry_over(previous_poll.days, previous_response, poll.days))
+        bot.db.replace_response(poll.id, interaction.user.id, carried)
         await _send_panel(interaction, poll, edit=False)
         bot.request_refresh(poll.id)
 

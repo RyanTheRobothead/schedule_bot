@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -76,6 +77,10 @@ class ScheduleBot(discord.Client):
     async def setup_hook(self) -> None:
         self.add_dynamic_items(StatusButton, SameAsLastButton, FineTuneButton, CloseButton, DefaultSelect, DaySelect)
         await self.tree.sync()
+        # dateparser loads its locale data on first use; do it now rather than inside
+        # a /schedule interaction, which has to respond within 3 seconds.
+        with contextlib.suppress(DateRangeError):  # e.g. "in the past" in early January
+            parse_date_range("jan 1 - jan 2", self.config.today())
         self.housekeeping.change_interval(minutes=self.config.housekeeping_minutes)
         self.housekeeping.start()
 

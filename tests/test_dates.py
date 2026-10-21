@@ -76,3 +76,12 @@ def test_dmy_order():
 def test_parse_date_range_errors(text):
     with pytest.raises(DateRangeError):
         parse_date_range(text, TUE)
+
+
+def test_startup_warmup_phrase_never_crashes_unexpectedly():
+    # bot.setup_hook parses this to warm up dateparser, suppressing only DateRangeError
+    for day in range(1, 32):
+        try:
+            parse_date_range("jan 1 - jan 2", date(2027, 1, day))
+        except DateRangeError:
+            pass
