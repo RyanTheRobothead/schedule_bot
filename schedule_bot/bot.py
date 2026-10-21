@@ -99,6 +99,7 @@ class ScheduleBot(discord.Client):
         self._pending_refresh: set[int] = set()
         self._background: set[asyncio.Task] = set()
         self._health_runner = None
+        self._recurrence_locks: dict[int, asyncio.Lock] = {}
 
     async def setup_hook(self) -> None:
         self.add_dynamic_items(
@@ -329,7 +330,7 @@ class ScheduleBot(discord.Client):
     def _recurring_list(self, guild_id: int) -> dict:
         recs = self.db.active_recurrences(guild_id)
         if not recs:
-            return dict(content=NO_RECURRING, view=None)
+            return dict(content=NO_RECURRING)  # no view key: send_message(view=None) raises
         # period_start is always the next period still to be posted; if its time has
         # passed, housekeeping will post it within a few minutes.
         now = time.time()
@@ -348,7 +349,14 @@ class ScheduleBot(discord.Client):
 
         Idempotent: a period that already has a poll isn't posted again, so a crash or
         error between posting and advancing can neither double-post nor skip a week.
+        The lock covers creation and housekeeping running it at the same moment.
         """
+        async with self._recurrence_locks.setdefault(rec.id, asyncio.Lock()):
+            rec = self.db.get_recurrence(rec.id)
+            if rec is not None and rec.active:
+                await self._run_recurrence_unlocked(rec)
+
+    async def _run_recurrence_unlocked(self, rec: Recurrence) -> None:
         today = self.config.today()
         start = catch_up(rec.period_start, rec.period_days, rec.interval_weeks, today)
         if start != rec.period_start:
@@ -416,7 +424,7 @@ class ScheduleBot(discord.Client):
             await interaction.response.send_message(**notice)  # the poll itself refreshes below
         else:
             if message.content.startswith((LIST_HEADER, NO_RECURRING)):
-                await interaction.response.edit_message(**self._recurring_list(rec.guild_id))
+                await interaction.response.edit_message(**{"view": None, **self._recurring_list(rec.guild_id)})
             else:  # the "Got it" confirmation
                 await interaction.response.edit_message(view=None)
             await interaction.followup.send(**notice)

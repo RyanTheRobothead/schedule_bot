@@ -173,3 +173,34 @@ def test_invitees_who_left_stop_the_recurrence(clock, monkeypatch):
     run(bot, rec.id)  # user 99 isn't in the guild anymore
     assert polls(bot) == [] and not bot.db.get_recurrence(rec.id).active
     assert "Stopped repeating" in channel.sent[0].content
+
+
+def test_empty_list_has_no_view_key(monkeypatch):
+    # InteractionResponse.send_message(view=None) raises, so the key must be absent
+    bot = make_bot(FakeChannel(), monkeypatch)
+    assert "view" not in bot._recurring_list(999)
+
+
+def test_concurrent_runs_post_once(clock, monkeypatch):
+    channel = FakeChannel()
+    bot = make_bot(channel, monkeypatch)
+    clock(2026, 10, 20, 12)
+    rec = create(bot, channel, "<@1> every week")
+    clock(2026, 10, 22, 18, 2)
+
+    async def both():
+        await asyncio.gather(bot._run_recurrence(rec), bot._run_recurrence(rec))
+
+    asyncio.run(both())
+    assert len(polls(bot)) == 1
+
+
+def test_stopped_recurrence_does_not_post(clock, monkeypatch):
+    channel = FakeChannel()
+    bot = make_bot(channel, monkeypatch)
+    clock(2026, 10, 20, 12)
+    rec = create(bot, channel, "<@1> every week")
+    bot.db.deactivate_recurrence(rec.id)
+    clock(2026, 10, 22, 18, 2)
+    asyncio.run(bot._run_recurrence(rec))  # stale object still says active
+    assert polls(bot) == []
