@@ -49,6 +49,7 @@ class Poll:
     next_nag_at: float | None
     closed: bool
     nag_time: time | None = None  # wall-clock time for whole-day intervals
+    recurrence_id: int | None = None
 
     @property
     def days(self) -> list[date]:
@@ -57,6 +58,31 @@ class Poll:
     @property
     def jump_url(self) -> str:
         return f"https://discord.com/channels/{self.guild_id}/{self.channel_id}/{self.message_id}"
+
+
+@dataclass
+class Recurrence:
+    """A poll that gets posted automatically for each period (see recurrence.py)."""
+
+    id: int
+    guild_id: int
+    channel_id: int
+    creator_id: int
+    title: str
+    period_start: date  # start of the next period to post a poll for
+    period_days: int
+    interval_weeks: int
+    lead_days: int
+    post_time: time
+    nag_interval: int
+    nag_time: time | None
+    user_ids: set[int]
+    role_ids: set[int]
+    active: bool
+
+    @property
+    def period_end(self) -> date:
+        return self.period_start + timedelta(days=self.period_days - 1)
 
 
 @dataclass

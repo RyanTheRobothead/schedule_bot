@@ -22,11 +22,24 @@ from .invocation import (
     InvocationError,
     extract_mentions,
     parse_invocation,
+    parse_lead,
     parse_nag,
 )
-from .models import Poll
+from .models import Poll, Recurrence
 from .nagging import first_nag_at, next_nag_at
-from .render import closing_text, mentions, poll_embed, range_label
+from .recurrence import (
+    DEFAULT_LEAD_DAYS,
+    DEFAULT_POST_TIME,
+    RecurrenceError,
+    catch_up,
+    next_period,
+    period_label,
+    post_at,
+    repeat_label,
+    upcoming_post,
+    validate,
+)
+from .render import closing_text, mentions, poll_embed, range_label, recurrence_line, time_label, when_label
 from .views import (
     CloseButton,
     DaySelect,
@@ -34,7 +47,9 @@ from .views import (
     FineTuneButton,
     SameAsLastButton,
     StatusButton,
+    StopRepeatingButton,
     poll_view,
+    recurrence_view,
 )
 
 log = logging.getLogger(__name__)
@@ -56,8 +71,16 @@ Up to {MAX_DAYS} days.
 **Reminders** — by default I'll ping anyone who hasn't answered once a day, in the evening. \
 `nag=12h`, `nag=2d`, `nag=9am` (daily at 9am), `nag=2d@7pm`, or `nag=off`.
 
+**Repeating** — add `every week`, `every 2 weeks`, `every other week`, `every friday` or `every weekend` and I'll post a fresh poll \
+for each period automatically, {DEFAULT_LEAD_DAYS} days ahead at {time_label(DEFAULT_POST_TIME)} unless you say `lead=2d`, `lead=1w`, or `lead=3d@9am`. \
+`@schedule_bot recurring` (or `/recurring`) lists them; each has a 🛑 button to stop it.
+
 **Answering** — click your usual availability on the poll (or 🔁 to copy your last answer), then use the day menus that pop up for the exceptions.
-Example: `@schedule_bot fri-sun "One-shot" @Players nag=12h`"""
+Example: `@schedule_bot fri-sun "One-shot" @Players nag=12h`
+Example: `@schedule_bot every week "Game night" @Players lead=3d`"""
+_ERRORS = (DateRangeError, InvocationError, RecurrenceError)
+LIST_HEADER = "🔁 **Repeating polls**"
+NO_RECURRING = "No repeating polls here. Start one with e.g. `@schedule_bot every week`."
 
 SendPoll = Callable[..., Awaitable[discord.Message]]
 
@@ -72,12 +95,15 @@ class ScheduleBot(discord.Client):
         self.db = Database(config.db_path)
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(schedule_command)
+        self.tree.add_command(recurring_command)
         self._pending_refresh: set[int] = set()
         self._background: set[asyncio.Task] = set()
         self._health_runner = None
 
     async def setup_hook(self) -> None:
-        self.add_dynamic_items(StatusButton, SameAsLastButton, FineTuneButton, CloseButton, DefaultSelect, DaySelect)
+        self.add_dynamic_items(
+            StatusButton, SameAsLastButton, FineTuneButton, CloseButton, DefaultSelect, DaySelect, StopRepeatingButton
+        )
         await self.tree.sync()
         # dateparser loads its locale data on first use; do it now rather than inside
         # a /schedule interaction, which has to respond within 3 seconds.
@@ -113,11 +139,21 @@ class ScheduleBot(discord.Client):
             if inv.help:
                 await message.reply(HELP_TEXT, mention_author=False)
                 return
+            if inv.list_recurring:
+                await message.reply(**self._recurring_list(message.guild.id), mention_author=False)
+                return
             users = [m for m in message.mentions if m.id != self.user.id]
             roles = [r for r in message.role_mentions if not self._is_bot_role(r)]
-            poll = await self._prepare_poll(message.channel, message.author, inv, users, roles)
-        except (DateRangeError, InvocationError) as e:
+            if inv.repeat_weeks is not None:
+                rec = await self._create_recurrence(message.channel, message.author, inv, users, roles)
+            else:
+                poll = await self._prepare_poll(message.channel, message.author, inv, users, roles)
+        except _ERRORS as e:
             await message.reply(f"⚠️ {e}\nSay `@{self.user.name} help` for examples.", mention_author=False)
+            return
+        if inv.repeat_weeks is not None:
+            await message.reply(**self._recurrence_created(rec), mention_author=False)
+            await self._run_recurrence(rec)
             return
         try:
             sent = await self._post_poll(poll, message.channel.send)
@@ -127,21 +163,39 @@ class ScheduleBot(discord.Client):
         log.info("Created poll %s in #%s via mention (message %s)", poll.id, message.channel, sent.id)
 
     async def schedule_from_interaction(
-        self, interaction: discord.Interaction, dates: str, title: str, invite: str, nag: str
+        self,
+        interaction: discord.Interaction,
+        dates: str,
+        title: str,
+        invite: str,
+        nag: str,
+        repeat_weeks: int | None = None,
+        lead: str = "",
     ) -> None:
         guild, channel = interaction.guild, interaction.channel
         try:
-            inv = Invocation(title=title.strip() or DEFAULT_TITLE, date_text=dates)
+            inv = Invocation(title=title.strip() or DEFAULT_TITLE, date_text=dates, repeat_weeks=repeat_weeks)
             if nag.strip():
                 inv.nag_seconds, inv.nag_time = parse_nag(nag)
+            if lead.strip():
+                if repeat_weeks is None:
+                    raise InvocationError("`lead` only applies to repeating polls; pick a `repeat` too.")
+                inv.lead_days, inv.lead_time = parse_lead(lead)
             user_ids, role_ids = extract_mentions(invite)
             users = [m for uid in user_ids if (m := guild.get_member(uid)) is not None]
             roles = [r for rid in role_ids if (r := guild.get_role(rid)) is not None and not self._is_bot_role(r)]
             if invite.strip() and not (users or roles) and "@everyone" not in invite and "@here" not in invite:
                 raise InvocationError("I couldn't find anyone in `invite` — pick people or roles with @.")
-            poll = await self._prepare_poll(channel, interaction.user, inv, users, roles)
-        except (DateRangeError, InvocationError) as e:
+            if repeat_weeks is not None:
+                rec = await self._create_recurrence(channel, interaction.user, inv, users, roles)
+            else:
+                poll = await self._prepare_poll(channel, interaction.user, inv, users, roles)
+        except _ERRORS as e:
             await interaction.response.send_message(f"⚠️ {e}", ephemeral=True)
+            return
+        if repeat_weeks is not None:
+            await interaction.response.send_message(**self._recurrence_created(rec))
+            await self._run_recurrence(rec)
             return
 
         async def send(**kwargs) -> discord.Message:
@@ -163,14 +217,22 @@ class ScheduleBot(discord.Client):
         if not participants:
             raise InvocationError("I couldn't find anyone to invite.")
 
+        interval, nag_time = self._nag_settings(inv)
+        return self._store_poll(channel, author.id, inv.title, start, end, interval, nag_time, participants)
+
+    def _nag_settings(self, inv: Invocation):
         interval = self.config.default_nag_seconds if inv.nag_seconds is None else inv.nag_seconds
-        nag_time = inv.nag_time or self.config.default_nag_time
+        return interval, inv.nag_time or self.config.default_nag_time
+
+    def _store_poll(
+        self, channel, creator_id, title, start, end, interval, nag_time, participants, recurrence_id=None
+    ) -> Poll:
         now = time.time()
         return self.db.create_poll(
             guild_id=channel.guild.id,
             channel_id=channel.id,
-            creator_id=author.id,
-            title=inv.title,
+            creator_id=creator_id,
+            title=title,
             start=start,
             end=end,
             nag_interval=interval,
@@ -178,16 +240,32 @@ class ScheduleBot(discord.Client):
             next_nag_at=first_nag_at(now, interval, nag_time, self.config.tz),
             created_at=now,
             participants=participants,
+            recurrence_id=recurrence_id,
         )
+
+    def _render_poll(self, poll: Poll):
+        """The embed and view for a poll's message, including recurrence info while it's repeating."""
+        rec = self.db.get_recurrence(poll.recurrence_id) if poll.recurrence_id else None
+        repeating = rec is not None and rec.active and not poll.closed
+        note = None
+        if repeating:
+            nxt = upcoming_post(
+                rec.period_start, rec.lead_days, rec.post_time, rec.interval_weeks, time.time(), self.config.tz
+            )
+            note = f"Repeats {repeat_label(rec.interval_weeks)}, next poll {when_label(nxt, self.config.tz)}"
+        embed = poll_embed(poll, self.db.responses(poll.id), repeat_note=note)
+        view = None if poll.closed else poll_view(poll, rec.id if repeating else None)
+        return embed, view
 
     async def _post_poll(self, poll: Poll, send: SendPoll) -> discord.Message:
         """Post a stored poll with ``send``; the poll is deleted again if that fails."""
         participants = self.db.participants(poll.id)
         try:
+            embed, view = self._render_poll(poll)
             sent = await send(
                 content=f"📣 {mentions(participants, PING_LIMIT)} — when can you make **{poll.title}**?",
-                embed=poll_embed(poll, self.db.responses(poll.id)),
-                view=poll_view(poll),
+                embed=embed,
+                view=view,
             )
         except discord.HTTPException:
             self.db.delete_poll(poll.id)
@@ -209,6 +287,141 @@ class ScheduleBot(discord.Client):
         else:
             members = getattr(channel, "members", [])
         return {m.id for m in members if m is not None and not m.bot}
+
+    # --- recurring polls -----------------------------------------------------
+
+    async def _create_recurrence(self, channel, author, inv: Invocation, users, roles) -> Recurrence:
+        # Unclamped, so "every week this week" repeats Mon–Sun rather than from today.
+        start, end = parse_date_range(inv.date_text, self.config.today(), self.config.date_order, clamp=False)
+        period_days = (end - start).days + 1
+        lead_days = DEFAULT_LEAD_DAYS if inv.lead_days is None else inv.lead_days
+        validate(period_days, inv.repeat_weeks, lead_days)
+        if not await self._resolve_participants(channel, users, roles):
+            raise InvocationError("I couldn't find anyone to invite.")
+        interval, nag_time = self._nag_settings(inv)
+        return self.db.create_recurrence(
+            guild_id=channel.guild.id,
+            channel_id=channel.id,
+            creator_id=author.id,
+            title=inv.title,
+            period_start=catch_up(start, period_days, inv.repeat_weeks, self.config.today()),
+            period_days=period_days,
+            interval_weeks=inv.repeat_weeks,
+            lead_days=lead_days,
+            post_time=inv.lead_time or DEFAULT_POST_TIME,
+            nag_interval=interval,
+            nag_time=nag_time,
+            user_ids={u.id for u in users},
+            role_ids={r.id for r in roles},
+        )
+
+    def _recurrence_created(self, rec: Recurrence) -> dict:
+        first = post_at(rec.period_start, rec.lead_days, rec.post_time, self.config.tz)
+        ahead = "on the first day" if rec.lead_days == 0 else f"{rec.lead_days} day{'s' * (rec.lead_days != 1)} ahead"
+        when = "is going out now" if first <= time.time() else f"goes out {when_label(first, self.config.tz)}"
+        content = (
+            f"🔁 Got it: I'll post a **{rec.title}** poll for {period_label(rec.period_start, rec.period_days)} "
+            f"{repeat_label(rec.interval_weeks)}, {ahead} at {time_label(rec.post_time)}. "
+            f"The first one ({range_label(rec.period_start, rec.period_end)}) {when}."
+        )
+        return dict(content=content, view=recurrence_view([rec.id]), allowed_mentions=discord.AllowedMentions.none())
+
+    def _recurring_list(self, guild_id: int) -> dict:
+        recs = self.db.active_recurrences(guild_id)
+        if not recs:
+            return dict(content=NO_RECURRING, view=None)
+        # period_start is always the next period still to be posted; if its time has
+        # passed, housekeeping will post it within a few minutes.
+        now = time.time()
+        lines = [
+            recurrence_line(r, max(now, post_at(r.period_start, r.lead_days, r.post_time, self.config.tz)), self.config.tz)
+            for r in recs
+        ]
+        return dict(
+            content=LIST_HEADER + "\n" + "\n".join(lines)[:1900],
+            view=recurrence_view([r.id for r in recs], labelled=True),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _run_recurrence(self, rec: Recurrence) -> None:
+        """Post the recurrence's current period if it's due, then move on to the next period.
+
+        Idempotent: a period that already has a poll isn't posted again, so a crash or
+        error between posting and advancing can neither double-post nor skip a week.
+        """
+        today = self.config.today()
+        start = catch_up(rec.period_start, rec.period_days, rec.interval_weeks, today)
+        if start != rec.period_start:
+            self.db.set_recurrence_period(rec.id, start)
+        if time.time() < post_at(start, rec.lead_days, rec.post_time, self.config.tz):
+            return
+        end = start + (rec.period_end - rec.period_start)
+
+        if not self.db.recurrence_has_poll(rec.id, end):
+            channel = self.get_channel(rec.channel_id)
+            try:
+                channel = channel or await self.fetch_channel(rec.channel_id)
+            except (discord.NotFound, discord.Forbidden):
+                log.warning("Recurrence %s: channel %s is gone; stopping it", rec.id, rec.channel_id)
+                self.db.deactivate_recurrence(rec.id)
+                return
+            guild = channel.guild
+            users = [m for uid in rec.user_ids if (m := guild.get_member(uid)) is not None]
+            roles = [r for rid in rec.role_ids if (r := guild.get_role(rid)) is not None]
+            participants = set()
+            if users or roles or not (rec.user_ids or rec.role_ids):
+                participants = await self._resolve_participants(channel, users, roles)
+            if not participants:
+                log.warning("Recurrence %s: nobody left to invite; stopping it", rec.id)
+                self.db.deactivate_recurrence(rec.id)
+                with contextlib.suppress(discord.HTTPException):
+                    await channel.send(
+                        f"🛑 Stopped repeating **{rec.title}**: none of the people or roles it invited are here anymore.",
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                return
+            interval = rec.nag_interval
+            poll = self._store_poll(
+                channel, rec.creator_id, rec.title, max(start, today), end, interval, rec.nag_time, participants, rec.id
+            )
+            try:
+                sent = await self._post_poll(poll, channel.send)
+            except (discord.NotFound, discord.Forbidden):
+                log.warning("Recurrence %s: can't post in channel %s; stopping it", rec.id, rec.channel_id)
+                self.db.deactivate_recurrence(rec.id)
+                return
+            except discord.HTTPException:
+                return  # _post_poll removed the poll; try again next time round
+            log.info("Recurrence %s posted poll %s (message %s)", rec.id, poll.id, sent.id)
+
+        self.db.set_recurrence_period(rec.id, next_period(start, rec.interval_weeks))
+
+    async def stop_recurrence(self, interaction: discord.Interaction, recurrence_id: int) -> None:
+        rec = self.db.get_recurrence(recurrence_id)
+        if rec is None or not rec.active:
+            await interaction.response.send_message("That poll has already stopped repeating.", ephemeral=True)
+            return
+        if interaction.user.id != rec.creator_id and not interaction.permissions.manage_messages:
+            await interaction.response.send_message(
+                f"Only <@{rec.creator_id}> (or a moderator) can stop this.", ephemeral=True
+            )
+            return
+        self.db.deactivate_recurrence(rec.id)
+        notice = dict(
+            content=f"🛑 {interaction.user.mention} stopped repeating **{rec.title}**. Polls already posted stay open.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        message = interaction.message
+        if message is None or self.db.poll_by_message(message.id) is not None:
+            await interaction.response.send_message(**notice)  # the poll itself refreshes below
+        else:
+            if message.content.startswith((LIST_HEADER, NO_RECURRING)):
+                await interaction.response.edit_message(**self._recurring_list(rec.guild_id))
+            else:  # the "Got it" confirmation
+                await interaction.response.edit_message(view=None)
+            await interaction.followup.send(**notice)
+        for poll in self.db.open_polls_for_recurrence(rec.id):
+            self.request_refresh(poll.id)
 
     # --- interactions helpers ---------------------------------------------
 
@@ -254,9 +467,9 @@ class ScheduleBot(discord.Client):
         message = await self._poll_message(poll)
         if message is None:
             return
-        view = None if poll.closed else poll_view(poll)
+        embed, view = self._render_poll(poll)
         try:
-            await message.edit(embed=poll_embed(poll, self.db.responses(poll.id)), view=view)
+            await message.edit(embed=embed, view=view)
         except discord.NotFound:
             log.info("Poll %s message was deleted; closing it", poll.id)
             self.db.close_poll(poll.id)
@@ -292,6 +505,11 @@ class ScheduleBot(discord.Client):
 
     @tasks.loop(minutes=5)
     async def housekeeping(self) -> None:
+        for rec in self.db.active_recurrences():
+            try:
+                await self._run_recurrence(rec)
+            except Exception:
+                log.exception("Housekeeping failed for recurrence %s", rec.id)
         today = self.config.today()
         now = time.time()
         for poll in self.db.open_polls():
@@ -314,10 +532,35 @@ class ScheduleBot(discord.Client):
     title='What it\'s for, e.g. "One-shot" (default: Game night)',
     invite="@people and/or @roles to invite (default: everyone who can see this channel)",
     nag="Reminder interval: daily, 12h, 2d, 9am, 2d@7pm, off (default: daily, evenings)",
+    repeat="Post a fresh poll for these days automatically, on repeat",
+    lead=f"For repeating polls, how far ahead to post: 2d, 1w, 3d@9am (default: {DEFAULT_LEAD_DAYS}d at 6pm)",
+)
+@app_commands.choices(
+    repeat=[
+        app_commands.Choice(name="Every week", value=1),
+        app_commands.Choice(name="Every 2 weeks", value=2),
+        app_commands.Choice(name="Every 3 weeks", value=3),
+        app_commands.Choice(name="Every 4 weeks", value=4),
+    ]
 )
 @app_commands.guild_only()
 async def schedule_command(
-    interaction: discord.Interaction, dates: str = "", title: str = "", invite: str = "", nag: str = ""
+    interaction: discord.Interaction,
+    dates: str = "",
+    title: str = "",
+    invite: str = "",
+    nag: str = "",
+    repeat: app_commands.Choice[int] | None = None,
+    lead: str = "",
 ) -> None:
     bot: ScheduleBot = interaction.client  # type: ignore[assignment]
-    await bot.schedule_from_interaction(interaction, dates, title, invite, nag)
+    await bot.schedule_from_interaction(
+        interaction, dates, title, invite, nag, repeat.value if repeat else None, lead
+    )
+
+
+@app_commands.command(name="recurring", description="List this server's repeating polls (with buttons to stop them)")
+@app_commands.guild_only()
+async def recurring_command(interaction: discord.Interaction) -> None:
+    bot: ScheduleBot = interaction.client  # type: ignore[assignment]
+    await interaction.response.send_message(**bot._recurring_list(interaction.guild.id), ephemeral=True)

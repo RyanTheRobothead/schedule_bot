@@ -32,14 +32,27 @@ _DAY_SELECT_PLACEHOLDER = {
 }
 
 
-def poll_view(poll: Poll) -> discord.ui.View:
-    """Components attached to the public poll message."""
+def poll_view(poll: Poll, repeating_id: int | None = None) -> discord.ui.View:
+    """Components attached to the public poll message.
+
+    ``repeating_id`` adds a stop button for the still-active recurrence that posted this poll.
+    """
     view = discord.ui.View(timeout=None)
     for status in STATUS_ORDER:
         view.add_item(StatusButton(poll.id, status))
     view.add_item(SameAsLastButton(poll.id))
     view.add_item(FineTuneButton(poll.id))
     view.add_item(CloseButton(poll.id))
+    if repeating_id is not None:
+        view.add_item(StopRepeatingButton(repeating_id, row=1))
+    return view
+
+
+def recurrence_view(recurrence_ids: list[int], labelled: bool = False) -> discord.ui.View:
+    """Stop buttons for one or more recurrences (labelled by id when there are several)."""
+    view = discord.ui.View(timeout=None)
+    for rid in recurrence_ids[:25]:
+        view.add_item(StopRepeatingButton(rid, label=f"Stop #{rid}" if labelled else None))
     return view
 
 
@@ -262,3 +275,27 @@ class DaySelect(discord.ui.DynamicItem[discord.ui.Select], template=r"sched:days
         bot.db.set_days_for_status(poll.id, interaction.user.id, self.status, [d for d in picked if d in valid])
         await _send_panel(interaction, poll, edit=True)
         bot.request_refresh(poll.id)
+
+
+class StopRepeatingButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sched:rstop:(?P<rec>\d+)"):
+    """Stops a recurring poll from being posted again. Polls already posted stay open."""
+
+    def __init__(self, recurrence_id: int, label: str | None = None, row: int | None = None):
+        super().__init__(
+            discord.ui.Button(
+                label=label or "Stop repeating",
+                emoji="🛑",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"sched:rstop:{recurrence_id}",
+            ),
+            row=row,
+        )
+        self.recurrence_id = recurrence_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["rec"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        bot: ScheduleBot = interaction.client  # type: ignore[assignment]
+        await bot.stop_recurrence(interaction, self.recurrence_id)

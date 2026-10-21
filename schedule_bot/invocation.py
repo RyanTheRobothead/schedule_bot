@@ -13,6 +13,14 @@ _NO_NAG = re.compile(r"\b(?:no[\s-]?nag|nag\s+off)\b")
 _DURATION = re.compile(r"(\d+(?:\.\d+)?)\s*(m|min|mins|minutes?|h|hr|hrs|hours?|d|days?|w|weeks?)")
 _UNIT_SECONDS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
 _TIME_OF_DAY = re.compile(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?")
+_LEAD = re.compile(r"\blead\s*[=:]\s*(\S+)")
+_LEAD_DAYS = re.compile(r"(\d+)\s*(d|days?|w|weeks?)?")
+_WEEKDAY_WORD = r"mon(?:day)?|tues?(?:day)?|wed(?:nesday)?|thu(?:rs?)?(?:day)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?"
+_REPEAT = re.compile(
+    r"\b(?:(?P<weekly>weekly)|(?P<biweekly>bi-?weekly|fortnightly)"
+    r"|every\s+(?:(?P<other>other\s+week)|(?P<n>\d+)\s+weeks?|(?P<week>week)|(?P<what>weekend|" + _WEEKDAY_WORD + r")))\b"
+)
+_LIST_RECURRING = re.compile(r"(?:list\s+)?(?:recurring|repeating|recurrences)(?:\s+polls)?")
 _USER_MENTION = re.compile(r"<@!?(\d+)>")
 _ROLE_MENTION = re.compile(r"<@&(\d+)>")
 
@@ -31,6 +39,10 @@ class Invocation:
     nag_time: time | None = None  # None means "use the configured default"
     date_text: str = ""
     help: bool = False
+    repeat_weeks: int | None = None  # set for recurring polls
+    lead_days: int | None = None  # None means the default
+    lead_time: time | None = None  # None means the default
+    list_recurring: bool = False
 
 
 def parse_duration(text: str) -> int:
@@ -82,6 +94,37 @@ def parse_nag(text: str) -> tuple[int, time | None]:
     return parse_duration(text), None
 
 
+def parse_lead(text: str) -> tuple[int, time | None]:
+    """How far ahead a recurring poll goes out: '4d', '1w', '2d@9am', '0d@6pm' (on the first day)."""
+    text = text.lower().strip()
+    days_text, _, at = text.partition("@")
+    m = _LEAD_DAYS.fullmatch(days_text.strip())
+    if not m:
+        raise InvocationError(f"I couldn't understand `lead={text}` (try `lead=4d` or `lead=2d@9am`).")
+    days = int(m[1]) * (7 if m[2] and m[2].startswith("w") else 1)
+    return days, parse_time_of_day(at) if at else None
+
+
+def parse_repeat(text: str) -> tuple[int | None, str]:
+    """Pull a repeat phrase out of the date text: ('every 2 weeks fri-sun') -> (2, 'fri-sun').
+
+    'every friday' / 'every weekend' repeat weekly and leave 'friday' / 'weekend' as the dates.
+    """
+    m = _REPEAT.search(text.lower())
+    if not m:
+        return None, text
+    rest = (text[: m.start()] + " " + text[m.end() :]).strip()
+    if m["n"]:
+        weeks = int(m["n"])
+    elif m["biweekly"] or m["other"]:
+        weeks = 2
+    else:
+        weeks = 1
+    if m["what"]:
+        rest = f"{m['what']} {rest}".strip()
+    return weeks, " ".join(rest.split())
+
+
 def extract_mentions(text: str) -> tuple[set[int], set[int]]:
     """User and role ids mentioned in raw message text."""
     return {int(i) for i in _USER_MENTION.findall(text)}, {int(i) for i in _ROLE_MENTION.findall(text)}
@@ -102,9 +145,18 @@ def parse_invocation(content: str) -> Invocation:
         inv.nag_seconds = 0
         text = text[: m.start()] + " " + text[m.end() :]
 
+    if m := _LEAD.search(text):
+        inv.lead_days, inv.lead_time = parse_lead(m[1])
+        text = text[: m.start()] + " " + text[m.end() :]
+
     text = " ".join(text.split())
     if text.lower() in ("help", "?", "-h", "--help"):
         inv.help = True
         text = ""
-    inv.date_text = text
+    elif _LIST_RECURRING.fullmatch(text.lower()):
+        inv.list_recurring = True
+        text = ""
+    inv.repeat_weeks, inv.date_text = parse_repeat(text)
+    if inv.repeat_weeks is None and (inv.lead_days is not None):
+        raise InvocationError("`lead=` only applies to repeating polls (e.g. `every week lead=3d`).")
     return inv

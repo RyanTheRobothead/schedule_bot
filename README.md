@@ -46,6 +46,38 @@ Whole-day intervals go out at the set time of day; shorter ones (`12h`) count fr
 **Closing:** the poll's creator (or anyone with Manage Messages) can click 🔒 *Close poll*, which
 freezes it and announces the best day. Polls close themselves once their last day has passed.
 
+## Repeating polls
+
+Add a repeat phrase and the bot posts a fresh poll for every period on its own:
+
+```
+@schedule_bot every week                          # each Mon–Sun, posted the Thursday before at 6pm
+@schedule_bot every friday "Board games" @Crew    # each Friday
+@schedule_bot every 2 weeks fri-sun lead=1d@9am   # every other Fri–Sun, posted Thursday 9am
+@schedule_bot every other week next 2 weeks       # back-to-back fortnights
+@schedule_bot recurring                           # list them (or /recurring)
+```
+
+- **Cadence** is weekly-based: `every week` / `weekly`, `every N weeks`, `every other week` /
+  `biweekly`, `every <weekday>`, `every weekend`. The dates work like a normal poll's and shift
+  forward by the cadence each time. (Monthly isn't supported; polls are capped at 25 days.)
+- **`lead=`** says how far ahead each poll goes out: `lead=4d` (default, at 6pm), `lead=1w`,
+  `lead=2d@9am`, `lead=0d@9am` (the morning of the first day). It's capped at the cadence so polls
+  don't pile up.
+- If you set one up when the first poll is already due (or the period is under way), that poll goes
+  out right away. If the bot was down, finished periods are skipped and one under way still gets
+  posted.
+- Invited people and roles are looked up fresh each time, so role membership changes carry over. If
+  none of them are left, the repeat stops itself and says so.
+- Reminders follow the usual rules for each poll. A poll posted at 6pm won't nag the same evening,
+  because the first reminder waits at least 6 hours.
+- **🛑 Stop repeating** is on the confirmation, on each repeating poll, and in the `/recurring` list.
+  The creator or anyone with Manage Messages can use it. Polls already posted stay open.
+
+With `/schedule`, pick a `repeat` (every 1–4 weeks) and optionally a `lead`.
+
+Posts go out within about 5 minutes of the set time.
+
 ### Invocation reference
 
 | Part | Examples | Default |
@@ -53,6 +85,8 @@ freezes it and announces the best day. Polls close themselves once their last da
 | Dates | `next week`, `this week`, `weekend`, `next weekend`, `next 10 days`, `2 weeks`, `friday`, `next fri`, `fri-sun`, `oct 30 - nov 3`, `Oct 25-31`, `11/1-11/7`, `2026-11-01..2026-11-07` | next Mon–Sun |
 | People | `@user` and/or `@role` mentions | everyone who can see the channel (thread members, in a thread) |
 | Title | `"Anything in double quotes"` | `Game night` |
+| Repeat | `every week`, `every 2 weeks`, `every other week`, `every friday`, `every weekend` | one-off poll |
+| Lead time (repeating) | `lead=4d`, `lead=1w`, `lead=2d@9am` | `lead=4d@6pm` |
 | Reminders | `nag=12h`, `nag=daily`, `nag=9am`, `nag=2d@7pm`, `nag=off`, `no nag` | `SCHEDULE_BOT_NAG` (daily) at `SCHEDULE_BOT_NAG_TIME` (6pm) |
 
 Ranges are capped at 25 days, since Discord select menus hold at most 25 options. Days that have
@@ -135,6 +169,7 @@ Layout:
 - `schedule_bot/invocation.py`: parsing the rest of the `@schedule_bot …` message
 - `schedule_bot/scoring.py`: per-day breakdown and ranking
 - `schedule_bot/nagging.py`: when reminders fire
+- `schedule_bot/recurrence.py`: repeating polls: periods, lead times, catching up
 - `schedule_bot/db.py`: SQLite storage
 - `schedule_bot/render.py`: embeds and panel text
 - `schedule_bot/views.py`: buttons and menus (`DynamicItem`s, so they keep working across restarts)

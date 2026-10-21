@@ -7,7 +7,7 @@ import time
 from datetime import date, time as dtime
 from pathlib import Path
 
-from .models import Poll, Status, UserResponse
+from .models import Poll, Recurrence, Status, UserResponse
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS polls (
@@ -23,7 +23,26 @@ CREATE TABLE IF NOT EXISTS polls (
     next_nag_at  REAL,
     closed       INTEGER NOT NULL DEFAULT 0,
     created_at   REAL NOT NULL,
-    nag_time     TEXT
+    nag_time     TEXT,
+    recurrence_id INTEGER REFERENCES recurrences(id)
+);
+CREATE TABLE IF NOT EXISTS recurrences (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id       INTEGER NOT NULL,
+    channel_id     INTEGER NOT NULL,
+    creator_id     INTEGER NOT NULL,
+    title          TEXT NOT NULL,
+    period_start   TEXT NOT NULL,
+    period_days    INTEGER NOT NULL,
+    interval_weeks INTEGER NOT NULL,
+    lead_days      INTEGER NOT NULL,
+    post_time      TEXT NOT NULL,
+    nag_interval   INTEGER NOT NULL,
+    nag_time       TEXT,
+    user_ids       TEXT NOT NULL DEFAULT '',
+    role_ids       TEXT NOT NULL DEFAULT '',
+    active         INTEGER NOT NULL DEFAULT 1,
+    created_at     REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS participants (
     poll_id INTEGER NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
@@ -61,6 +80,9 @@ class Database:
         if "nag_time" not in columns:  # added in 0.2
             with self.conn:
                 self.conn.execute("ALTER TABLE polls ADD COLUMN nag_time TEXT")
+        if "recurrence_id" not in columns:  # added in 0.3
+            with self.conn:
+                self.conn.execute("ALTER TABLE polls ADD COLUMN recurrence_id INTEGER REFERENCES recurrences(id)")
 
     # --- polls -------------------------------------------------------------
 
@@ -78,11 +100,13 @@ class Database:
         next_nag_at: float | None = None,
         nag_time: dtime | None = None,
         created_at: float | None = None,
+        recurrence_id: int | None = None,
     ) -> Poll:
         with self.conn:
             cur = self.conn.execute(
                 "INSERT INTO polls (guild_id, channel_id, creator_id, title, start_date, end_date,"
-                " nag_interval, next_nag_at, created_at, nag_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " nag_interval, next_nag_at, created_at, nag_time, recurrence_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     guild_id,
                     channel_id,
@@ -94,6 +118,7 @@ class Database:
                     next_nag_at,
                     time.time() if created_at is None else created_at,
                     nag_time.strftime("%H:%M") if nag_time else None,
+                    recurrence_id,
                 ),
             )
             poll_id = cur.lastrowid
@@ -111,6 +136,23 @@ class Database:
         rows = self.conn.execute("SELECT * FROM polls WHERE closed = 0 AND message_id IS NOT NULL")
         return [_row_to_poll(r) for r in rows]
 
+    def poll_by_message(self, message_id: int) -> Poll | None:
+        row = self.conn.execute("SELECT * FROM polls WHERE message_id = ?", (message_id,)).fetchone()
+        return _row_to_poll(row) if row else None
+
+    def open_polls_for_recurrence(self, recurrence_id: int) -> list[Poll]:
+        rows = self.conn.execute(
+            "SELECT * FROM polls WHERE recurrence_id = ? AND closed = 0 AND message_id IS NOT NULL", (recurrence_id,)
+        )
+        return [_row_to_poll(r) for r in rows]
+
+    def recurrence_has_poll(self, recurrence_id: int, end: date) -> bool:
+        """Whether this period's poll exists already. Keyed on the end date, since the start can be clamped."""
+        row = self.conn.execute(
+            "SELECT 1 FROM polls WHERE recurrence_id = ? AND end_date = ?", (recurrence_id, end.isoformat())
+        ).fetchone()
+        return row is not None
+
     def set_message_id(self, poll_id: int, message_id: int) -> None:
         with self.conn:
             self.conn.execute("UPDATE polls SET message_id = ? WHERE id = ?", (message_id, poll_id))
@@ -126,6 +168,72 @@ class Database:
     def delete_poll(self, poll_id: int) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM polls WHERE id = ?", (poll_id,))
+
+    # --- recurrences ---------------------------------------------------------
+
+    def create_recurrence(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        creator_id: int,
+        title: str,
+        period_start: date,
+        period_days: int,
+        interval_weeks: int,
+        lead_days: int,
+        post_time: dtime,
+        nag_interval: int,
+        nag_time: dtime | None,
+        user_ids: set[int],
+        role_ids: set[int],
+    ) -> Recurrence:
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO recurrences (guild_id, channel_id, creator_id, title, period_start, period_days,"
+                " interval_weeks, lead_days, post_time, nag_interval, nag_time, user_ids, role_ids, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    guild_id,
+                    channel_id,
+                    creator_id,
+                    title,
+                    period_start.isoformat(),
+                    period_days,
+                    interval_weeks,
+                    lead_days,
+                    post_time.strftime("%H:%M"),
+                    nag_interval,
+                    nag_time.strftime("%H:%M") if nag_time else None,
+                    ",".join(map(str, sorted(user_ids))),
+                    ",".join(map(str, sorted(role_ids))),
+                    time.time(),
+                ),
+            )
+        return self.get_recurrence(cur.lastrowid)
+
+    def get_recurrence(self, recurrence_id: int) -> Recurrence | None:
+        row = self.conn.execute("SELECT * FROM recurrences WHERE id = ?", (recurrence_id,)).fetchone()
+        return _row_to_recurrence(row) if row else None
+
+    def active_recurrences(self, guild_id: int | None = None) -> list[Recurrence]:
+        if guild_id is None:
+            rows = self.conn.execute("SELECT * FROM recurrences WHERE active = 1 ORDER BY id")
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM recurrences WHERE active = 1 AND guild_id = ? ORDER BY id", (guild_id,)
+            )
+        return [_row_to_recurrence(r) for r in rows]
+
+    def set_recurrence_period(self, recurrence_id: int, period_start: date) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE recurrences SET period_start = ? WHERE id = ?", (period_start.isoformat(), recurrence_id)
+            )
+
+    def deactivate_recurrence(self, recurrence_id: int) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE recurrences SET active = 0 WHERE id = ?", (recurrence_id,))
 
     # --- participants & responses -----------------------------------------
 
@@ -220,4 +328,29 @@ def _row_to_poll(row: sqlite3.Row) -> Poll:
         next_nag_at=row["next_nag_at"],
         closed=bool(row["closed"]),
         nag_time=dtime.fromisoformat(row["nag_time"]) if row["nag_time"] else None,
+        recurrence_id=row["recurrence_id"],
+    )
+
+
+def _ids(text: str) -> set[int]:
+    return {int(i) for i in text.split(",") if i}
+
+
+def _row_to_recurrence(row: sqlite3.Row) -> Recurrence:
+    return Recurrence(
+        id=row["id"],
+        guild_id=row["guild_id"],
+        channel_id=row["channel_id"],
+        creator_id=row["creator_id"],
+        title=row["title"],
+        period_start=date.fromisoformat(row["period_start"]),
+        period_days=row["period_days"],
+        interval_weeks=row["interval_weeks"],
+        lead_days=row["lead_days"],
+        post_time=dtime.fromisoformat(row["post_time"]),
+        nag_interval=row["nag_interval"],
+        nag_time=dtime.fromisoformat(row["nag_time"]) if row["nag_time"] else None,
+        user_ids=_ids(row["user_ids"]),
+        role_ids=_ids(row["role_ids"]),
+        active=bool(row["active"]),
     )

@@ -85,16 +85,30 @@ def test_breakdown_labels_who_is_out_or_maybe():
     assert line.endswith("— out: <@2> · maybe: <@3>")
 
 
-def test_migrates_pre_nag_time_database(tmp_path):
+V0_1_POLLS = """
+CREATE TABLE polls (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id     INTEGER NOT NULL,
+    channel_id   INTEGER NOT NULL,
+    message_id   INTEGER,
+    creator_id   INTEGER NOT NULL,
+    title        TEXT NOT NULL,
+    start_date   TEXT NOT NULL,
+    end_date     TEXT NOT NULL,
+    nag_interval INTEGER NOT NULL,
+    next_nag_at  REAL,
+    closed       INTEGER NOT NULL DEFAULT 0,
+    created_at   REAL NOT NULL
+);
+"""
+
+
+def test_migrates_v0_1_database(tmp_path):
     import sqlite3
 
-    from schedule_bot import db as dbmod
-
     path = tmp_path / "old.db"
-    old_schema = dbmod.SCHEMA.replace(",\n    nag_time     TEXT\n", "\n")
-    assert "nag_time" not in old_schema
     conn = sqlite3.connect(path)
-    conn.executescript(old_schema)
+    conn.executescript(V0_1_POLLS)
     conn.execute(
         "INSERT INTO polls (guild_id, channel_id, message_id, creator_id, title, start_date, end_date,"
         " nag_interval, next_nag_at, created_at) VALUES (1, 2, 3, 4, 'Old', '2026-10-26', '2026-11-01', 86400, 5, 6)"
@@ -102,8 +116,10 @@ def test_migrates_pre_nag_time_database(tmp_path):
     conn.commit()
     conn.close()
 
-    (poll,) = Database(path).open_polls()
-    assert poll.title == "Old" and poll.nag_time is None
+    db = Database(path)
+    (poll,) = db.open_polls()
+    assert poll.title == "Old" and poll.nag_time is None and poll.recurrence_id is None
+    assert db.active_recurrences() == []
     Database(path)  # reopening an already-migrated database is fine
 
 

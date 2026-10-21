@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import date, time
+from datetime import date, datetime, time
 
 import discord
 
-from .models import NO_ANSWER_EMOJI, STATUS_ORDER, Poll, Status, UserResponse
+from .models import NO_ANSWER_EMOJI, STATUS_ORDER, Poll, Recurrence, Status, UserResponse
+from .recurrence import period_label, repeat_label
 from .scoring import DaySummary, rank, summarize
 
 OPEN_COLOR = discord.Color.blurple()
@@ -83,7 +84,23 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def poll_embed(poll: Poll, responses: dict[int, UserResponse]) -> discord.Embed:
+def when_label(epoch: float, tz) -> str:
+    """e.g. 'Thu Oct 29 at 6pm'."""
+    moment = datetime.fromtimestamp(epoch, tz)
+    return f"{day_label(moment.date())} at {time_label(moment.time())}"
+
+
+def recurrence_line(rec: Recurrence, next_post: float, tz) -> str:
+    who = mentions(rec.user_ids) + (" " if rec.user_ids and rec.role_ids else "")
+    who += " ".join(f"<@&{rid}>" for rid in sorted(rec.role_ids))
+    return (
+        f"**#{rec.id} {rec.title}**: {period_label(rec.period_start, rec.period_days)}, "
+        f"{repeat_label(rec.interval_weeks)}, in <#{rec.channel_id}> for {who or 'everyone in the channel'}. "
+        f"Next poll {when_label(next_post, tz)}."
+    )
+
+
+def poll_embed(poll: Poll, responses: dict[int, UserResponse], repeat_note: str | None = None) -> discord.Embed:
     summaries = summarize(poll.days, responses)
     ranked = rank(summaries)
     best = ranked[0].day if ranked else None
@@ -117,6 +134,8 @@ def poll_embed(poll: Poll, responses: dict[int, UserResponse]) -> discord.Embed:
     legend = "  ".join(f"{s.emoji} {s.label}" for s in STATUS_ORDER) + f"  {NO_ANSWER_EMOJI} No answer"
     if not poll.closed:
         legend += f"  •  Reminders: {nag_label(poll.nag_interval, poll.nag_time)}"
+        if repeat_note:
+            legend += f"  •  {repeat_note}"
     embed.set_footer(text=legend)
     return embed
 

@@ -33,10 +33,12 @@ def next_week(today: date) -> tuple[date, date]:
     return start, start + timedelta(days=6)
 
 
-def parse_date_range(text: str, today: date, date_order: str = "MDY") -> tuple[date, date]:
+def parse_date_range(text: str, today: date, date_order: str = "MDY", clamp: bool = True) -> tuple[date, date]:
     """Turn free text into an inclusive (start, end) range.
 
-    An empty string means the next calendar week.
+    An empty string means the next calendar week. With ``clamp``, days already
+    past are dropped from the start; without it the range is returned as named
+    (e.g. "this week" starts on Monday), which recurring polls need.
     """
     text = " ".join(text.lower().replace(",", " ").split())
     text = re.sub(r"^(?:from|for|between|on)\s+", "", text)
@@ -47,7 +49,8 @@ def parse_date_range(text: str, today: date, date_order: str = "MDY") -> tuple[d
         raise DateRangeError("The end date is before the start date.")
     if end < today:
         raise DateRangeError("That date range is entirely in the past.")
-    start = max(start, today)
+    if clamp:
+        start = max(start, today)
     if (end - start).days + 1 > MAX_DAYS:
         raise DateRangeError(f"Date ranges can be at most {MAX_DAYS} days long.")
     return start, end
@@ -57,7 +60,7 @@ def _parse_keyword_range(text: str, today: date) -> tuple[date, date] | None:
     if text in ("", "next week"):
         return next_week(today)
     if text == "this week":
-        return today, today + timedelta(days=6 - today.weekday())
+        return today - timedelta(days=today.weekday()), today + timedelta(days=6 - today.weekday())
     if text in ("weekend", "this weekend"):
         if today.weekday() == 6:
             return today, today
