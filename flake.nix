@@ -22,7 +22,7 @@
       apps = forAllSystems (pkgs: {
         default = {
           type = "app";
-          program = "${self.packages.${pkgs.system}.default}/bin/schedule-bot";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/schedule-bot";
         };
       });
 
@@ -40,7 +40,7 @@
       });
 
       checks = forAllSystems (pkgs: {
-        default = self.packages.${pkgs.system}.default;
+        default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
       });
 
       nixosModules.default = import ./nix/module.nix self;
