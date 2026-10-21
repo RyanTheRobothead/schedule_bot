@@ -66,3 +66,10 @@ def test_close():
     assert [p.id for p in db.open_polls()] == [poll.id]
     db.close_poll(poll.id)
     assert db.open_polls() == []
+
+
+def test_mention_limit():
+    from schedule_bot.render import mentions
+
+    assert mentions([3, 1, 2]) == "<@1> <@2> <@3>"
+    assert mentions(range(100), 2) == "<@0> <@1> and 98 more"

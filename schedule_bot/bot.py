@@ -20,6 +20,7 @@ from .views import CloseButton, DaySelect, DefaultSelect, FineTuneButton, Status
 log = logging.getLogger(__name__)
 
 REFRESH_DELAY = 1.5  # seconds; coalesces bursts of clicks into one message edit
+PING_LIMIT = 50  # most people pinged in one message, to stay under the 2000-char content cap
 
 HELP_TEXT = f"""\
 **How to use me**
@@ -98,13 +99,15 @@ class ScheduleBot(discord.Client):
         )
         try:
             sent = await message.channel.send(
-                content=f"📣 {mentions(participants)} — when can you make **{poll.title}**?",
+                content=f"📣 {mentions(participants, PING_LIMIT)} — when can you make **{poll.title}**?",
                 embed=poll_embed(poll, self.db.responses(poll.id)),
                 view=poll_view(poll),
             )
-        except discord.HTTPException:
+        except discord.HTTPException as e:
             self.db.delete_poll(poll.id)
-            raise
+            log.exception("Failed to post poll")
+            await message.reply(f"⚠️ I couldn't post the poll: {e.text or e}", mention_author=False)
+            return
         self.db.set_message_id(poll.id, sent.id)
         log.info("Created poll %s in #%s for %s", poll.id, message.channel, range_label(start, end))
 
@@ -199,7 +202,7 @@ class ScheduleBot(discord.Client):
         if message is None:
             return
         await message.channel.send(
-            f"⏰ {mentions(waiting)} — still need your availability for **{poll.title}** "
+            f"⏰ {mentions(waiting, PING_LIMIT)} — still need your availability for **{poll.title}** "
             f"({range_label(poll.start, poll.end)}): {poll.jump_url}"
         )
 

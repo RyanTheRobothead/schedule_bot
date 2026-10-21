@@ -37,8 +37,13 @@ def nag_label(seconds: int) -> str:
     return f"every {seconds // 60}m"
 
 
-def mentions(user_ids) -> str:
-    return " ".join(f"<@{uid}>" for uid in sorted(user_ids))
+def mentions(user_ids, limit: int | None = None) -> str:
+    """Space-separated mentions; with ``limit``, extras become "and N more" (message content caps at 2000 chars)."""
+    ids = sorted(user_ids)
+    text = " ".join(f"<@{uid}>" for uid in ids[:limit])
+    if limit is not None and len(ids) > limit:
+        text += f" and {len(ids) - limit} more"
+    return text
 
 
 def summary_line(s: DaySummary) -> str:
